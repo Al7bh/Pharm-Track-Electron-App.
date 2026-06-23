@@ -1,0 +1,31 @@
+# Dependencies — too large, reinstalled with npm install
+node_modules/
+
+# Built frontend — regenerated with npm run build
+frontend/dist/
+
+# Database files — contains real patient/sales data, never upload
+*.db
+*.db-wal
+*.db-shm
+*.db-bak
+
+# Developer config — contains your server IP and password hash
+system-config.json
+
+# Electron build output
+release/
+dist/
+
+# Crash logs — contain sensitive error info
+crash-log.txt
+*.log
+
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment files
+.env
+.env.local

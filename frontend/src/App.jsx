@@ -3,7 +3,7 @@ import SalesCounter from "./components/SalesCounter";
 import StockManagement from "./components/StockManagement";
 import SalesHistory from "./components/SalesHistory";
 import OwnerEarnings from "./components/OwnerEarnings";
-
+import receiptLogo from "./assets/receipt-logo.png";
 // =========================================================================
 // ENTERPRISE GS1 BARCODE PARSER ENGINE
 // =========================================================================
@@ -802,9 +802,7 @@ const refreshStockLedger = () => {
         <div className="max-w-md w-full px-6 z-10 flex flex-col gap-8">
           <div className="flex flex-col items-center text-center gap-3">
             <div className="w-14 h-14 bg-white border border-slate-200 rounded-2xl flex items-center justify-center text-emerald-500 shadow-md">
-              <span className="material-symbols-outlined text-3xl">
-                local_pharmacy
-              </span>
+              <img src={receiptLogo} alt="Nouman Pharmacy" className="w-10 h-10 object-contain" />
             </div>
             <div className="space-y-1 mt-1">
               <h1 className="text-3xl font-black tracking-tight text-slate-800 uppercase">
@@ -1332,7 +1330,7 @@ const refreshStockLedger = () => {
                   : "justify-center p-0 border-transparent bg-transparent shadow-none"
               }`}>
                 <div className={`w-10 h-10 shrink-0 rounded-xl flex items-center justify-center border text-emerald-500 shadow-inner ${lightMode ? "bg-slate-100 border-slate-200" : "bg-slate-800 border-slate-700"}`}>
-                  <span className="material-symbols-outlined text-lg">local_pharmacy</span>
+                  <img src={receiptLogo} alt="Nouman Pharmacy" className="w-7 h-7 object-contain" />             
                 </div>
                 {isSidebarOpen && (
                   <div className="min-w-0 animate-in fade-in duration-300">

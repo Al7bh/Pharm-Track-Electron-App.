@@ -38,11 +38,13 @@
       "package.json",
       "frontend/dist/**/*"
     ],
-    "extraResources": [
-      "pharmacy.db"
-    ],
+"extraResources": [
+  "pharmacy.db",
+  { "from": "frontend/src/assets/receipt-logo.png", "to": "assets/receipt-logo.png" }
+],
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "icon": "frontend/src/assets/icon.ico"
     },
     "nsis": {
       "oneClick": false,

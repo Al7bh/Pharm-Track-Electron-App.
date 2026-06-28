@@ -406,37 +406,124 @@ function triggerReceiptPrint(cleanSaleId, timestamp, cartItems, subtotal, discou
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 
-    const receiptHtml = `<html><head><style>
-      body{font-family:monospace;font-size:14px;width:58mm;padding:5px;color:#000;margin:0}
-      .tc{text-align:center}.rj{display:flex;justify-content:space-between}
-      .bc{margin:10px 0 4px 0;text-align:center}.bc svg{width:90%;max-height:45px}
-      .id{font-size:11px;font-weight:bold;text-align:center;letter-spacing:2px;margin-bottom:8px}
+    // Load logo as base64 so it works both in dev and packaged builds
+    let logoHtml = '';
+    try {
+      const logoPath = app.isPackaged
+        ? path.join(process.resourcesPath, 'assets', 'receipt-logo.png')
+        : fs.existsSync(path.join(__dirname, 'assets', 'receipt-logo.png'))
+          ? path.join(__dirname, 'assets', 'receipt-logo.png')
+          : path.join(__dirname, 'frontend', 'src', 'assets', 'receipt-logo.png');
+      if (fs.existsSync(logoPath)) {
+        const logoBase64 = fs.readFileSync(logoPath).toString('base64');
+        logoHtml = `<div style="text-align:center;margin-bottom:4px;">
+          <img src="data:image/png;base64,${logoBase64}"
+               style="width:80px;height:80px;object-fit:contain;" alt="Logo" />
+        </div>`;
+      }
+    } catch (logoErr) {
+      // Logo load failed — fall through to text header silently
+    }
+
+    // Calculate total item discounts and global discount for proportional distribution
+    const totalItemDiscounts = cartItems.reduce((s, i) => s + Math.round(i.itemDiscountAmount || 0), 0);
+    const globalDiscountOnly = Math.max(0, Math.round(discountDeduction) - totalItemDiscounts);
+    const subtotalAfterItemDisc = Math.max(1, Math.round(subtotal) - totalItemDiscounts);
+
+    // Build per-item rows — 4 columns: Name+Qty | Price | Disc | Net
+    const itemRows = cartItems.map((i, idx) => {
+      const isLast       = idx === cartItems.length - 1;
+      const lineTotal    = Math.round((i.price || 0) * (i.qty || 1));
+      const itemDiscount = Math.round(i.itemDiscountAmount || 0);
+      const afterItemDisc = lineTotal - itemDiscount;
+
+      // Proportional share of the global bill discount for this line
+      const globalShare = globalDiscountOnly > 0
+        ? Math.round((afterItemDisc / subtotalAfterItemDisc) * globalDiscountOnly)
+        : 0;
+
+      const totalDiscForLine = itemDiscount + globalShare;
+      const netTotal = lineTotal - totalDiscForLine;
+      const sellType = i.type ? i.type.charAt(0).toUpperCase() : '';
+
+      return `
+        <div style="display:flex;justify-content:space-between;
+                    align-items:flex-start;margin-bottom:5px;
+                    padding-bottom:4px;
+                    ${isLast ? '' : 'border-bottom:1px dotted #ccc;'}
+                    font-size:11px;">
+          <span style="width:40%;word-break:break-all;font-weight:bold;">
+            ${escapeHtml(i.name)}
+            <span style="font-weight:normal;font-size:9px;"> (${sellType}) x${escapeHtml(i.qty)}</span>
+          </span>
+          <span style="width:20%;text-align:right;">Rs.${lineTotal}</span>
+          <span style="width:20%;text-align:right;color:#c00;">
+            ${totalDiscForLine > 0 ? `-${totalDiscForLine}` : '-'}
+          </span>
+          <span style="width:20%;text-align:right;font-weight:bold;">Rs.${netTotal}</span>
+        </div>`;
+    }).join('');
+
+    const globalDiscountRows = '';
+
+    const receiptHtml = `<html><head><meta charset="utf-8"/><style>
+      body{font-family:'Courier New',monospace;font-size:13px;width:58mm;padding:6px;color:#000;margin:0;}
+      .tc{text-align:center;}
+      .rj{display:flex;justify-content:space-between;}
+      .bc{margin:8px 0 2px 0;text-align:center;}
+      .bc svg{width:88%;max-height:44px;}
+      .id{font-size:11px;font-weight:bold;text-align:center;letter-spacing:2px;margin-bottom:6px;}
+      hr{border:none;border-top:1px dashed #000;margin:6px 0;}
+      .footer-note{font-size:9px;text-align:center;color:#555;margin-top:4px;line-height:1.4;}
     </style></head><body>
-      <h3 class="tc" style="margin:0;font-size:16px;">NOUMAN PHARMACY</h3>
-      <p class="tc" style="margin:2px 0;font-size:11px;">POS Counter Invoice</p>
-      <hr style="border-top:1px dashed #000"/>
+
+      ${logoHtml}
+      <div class="tc" style="font-size:16px;font-weight:900;letter-spacing:1px;margin-bottom:1px;">NOUMAN PHARMACY</div>
+      <div class="tc" style="font-size:10px;color:#444;margin-bottom:1px;">&#9990; 0328-3220140</div>
+      <div class="tc" style="font-size:10px;color:#444;margin-bottom:4px;">&#9993; noumanpharmacy12@gmail.com</div>
+
+      <hr/>
+
       <div class="bc">${barcodeSvg}</div>
       <div class="id">INV-${escapeHtml(cleanSaleId)}</div>
-      <p style="margin:6px 0;font-size:11px;"><b>Date:</b> ${new Date(timestamp).toLocaleString('en-PK')}</p>
-      <hr style="border-top:1px dashed #000"/>
-      <div style="font-weight:bold;border-bottom:1px dashed #000;margin-bottom:6px;padding-bottom:4px;font-size:11px;display:flex;justify-content:space-between">
-        <span style="width:50%">Item</span><span style="width:20%;text-align:center">Qty</span><span style="width:30%;text-align:right">Amount</span>
+      <div style="font-size:11px;margin-bottom:4px;">
+        <b>Date:</b> ${new Date(timestamp).toLocaleString('en-PK')}
       </div>
-      <div style="font-size:12px;line-height:1.4">
-        ${cartItems.map(i => `<div class="rj" style="margin-bottom:4px">
-          <span style="width:50%;word-break:break-all"><b>${escapeHtml(i.name)}</b></span>
-          <span style="width:20%;text-align:center">x${escapeHtml(i.qty)}</span>
-          <span style="width:30%;text-align:right">Rs. ${Math.round(i.price * i.qty)}</span>
-        </div>`).join('')}
+
+      <hr/>
+
+      <div style="display:flex;justify-content:space-between;font-weight:bold;
+                  font-size:10px;padding-bottom:4px;border-bottom:1px dashed #000;margin-bottom:4px;">
+        <span style="width:40%;">Item</span>
+        <span style="width:20%;text-align:right;">Price</span>
+        <span style="width:20%;text-align:right;">Disc</span>
+        <span style="width:20%;text-align:right;">Net</span>
       </div>
-      <hr style="border-top:1px dashed #000"/>
-      <div style="font-size:12px;line-height:1.3;margin-top:8px">
-        <div class="rj"><span>Gross Total:</span><span>Rs. ${Math.round(subtotal)}</span></div>
-        <div class="rj"><span>Discount:</span><span>- Rs. ${Math.round(discountDeduction)}</span></div>
-        <div class="rj" style="font-size:14px;margin-top:4px"><span><b>Net Paid:</b></span><span><b>Rs. ${Math.round(grandTotal)}</b></span></div>
+
+      <div style="font-size:11px;">
+        ${itemRows}
+        ${globalDiscountRows}
       </div>
-      <hr style="border-top:1px dashed #000;margin-top:8px"/>
-      <p class="tc" style="margin-top:10px;font-size:11px;font-weight:bold;">Thank you for your visit!</p>
+
+      <hr/>
+
+      <div style="font-size:12px;line-height:1.5;">
+        <div class="rj"><span>Subtotal</span><span>Rs.${Math.round(subtotal)}</span></div>
+        <div class="rj" style="font-size:14px;font-weight:900;margin-top:3px;padding-top:3px;border-top:1px solid #000;">
+          <span>NET PAID</span><span>Rs.${Math.round(grandTotal)}</span>
+        </div>
+      </div>
+
+      <hr/>
+
+      <div class="tc" style="font-size:11px;font-weight:bold;margin-top:6px;">
+        Thank you for your visit!
+      </div>
+      <div class="footer-note">
+        Return / Exchange only possible if original<br/>
+        receipt is presented within 3 days.
+      </div>
+
     </body></html>`;
 
     let printWindow = new BrowserWindow({ show: false });

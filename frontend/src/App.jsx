@@ -271,8 +271,18 @@ function App() {
   }, []);
 
   useEffect(() => {
+    // Initial fetch when the app opens
     refreshStockLedger();
     refreshSalesHistory();
+
+    // Background sync: Fetch the latest data from the server every 10 seconds
+    const syncInterval = setInterval(() => {
+      refreshStockLedger();
+      refreshSalesHistory();
+    }, 5000); // 5000 milliseconds = 5 seconds
+
+    // Cleanup the interval if the component unmounts
+    return () => clearInterval(syncInterval);
   }, []);
 
   // =========================================================================

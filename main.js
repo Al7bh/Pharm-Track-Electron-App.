@@ -141,20 +141,6 @@ if (IS_SERVER) {
   const expressApp = express();
   expressApp.use(express.json());
 
-  // Simple auth middleware — every client request must include the shared secret
-  // This is your DEV PASSWORD (the one used to access developer settings)
-  // It ensures only your own app instances can talk to the server, not random devices on the LAN
-  expressApp.use((req, res, next) => {
-    if (req.path === '/api/health') return next(); // health check is public
-    const key = req.headers['x-pharmtrack-key'];
-    if (!key || !sysConfig.devPasswordHash || !bcrypt.compareSync(key, sysConfig.devPasswordHash)) {
-      // If no dev password is set yet, allow connections (first-time setup)
-      if (!sysConfig.devPasswordHash) return next();
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-    next();
-  });
-
   // Health / status endpoint — used by client heartbeat and "Test Connection" button
   expressApp.get('/api/health', (req, res) => {
     res.json({ status: 'ok', mode: 'server', version: '1.4' });
@@ -467,14 +453,22 @@ function triggerReceiptPrint(cleanSaleId, timestamp, cartItems, subtotal, discou
     const globalDiscountRows = '';
 
     const receiptHtml = `<html><head><meta charset="utf-8"/><style>
-      body{font-family:'Courier New',monospace;font-size:13px;width:58mm;padding:6px;color:#000;margin:0;}
+      /* Force browser to recognize 80mm roll paper */
+      @page { margin: 0; size: 80mm 297mm; }
+      
+      /* Ensure padding doesn't stretch elements past 80mm */
+      *, *::before, *::after { box-sizing: border-box; }
+      
+      html, body { width: 80mm; margin: 0; padding: 0; background: #fff; }
+      body { font-family: 'Courier New', monospace; font-size: 14px; padding: 4px 8px; color: #000; }
+      
       .tc{text-align:center;}
       .rj{display:flex;justify-content:space-between;}
       .bc{margin:8px 0 2px 0;text-align:center;}
-      .bc svg{width:88%;max-height:44px;}
-      .id{font-size:11px;font-weight:bold;text-align:center;letter-spacing:2px;margin-bottom:6px;}
+      .bc svg{width:80%;max-height:50px;}
+      .id{font-size:13px;font-weight:bold;text-align:center;letter-spacing:2px;margin-bottom:6px;}
       hr{border:none;border-top:1px dashed #000;margin:6px 0;}
-      .footer-note{font-size:9px;text-align:center;color:#555;margin-top:4px;line-height:1.4;}
+      .footer-note{font-size:11px;text-align:center;color:#555;margin-top:4px;line-height:1.4;}
     </style></head><body>
 
       ${logoHtml}
@@ -500,12 +494,10 @@ function triggerReceiptPrint(cleanSaleId, timestamp, cartItems, subtotal, discou
         <span style="width:20%;text-align:right;">Net</span>
       </div>
 
-      <div style="font-size:11px;">
+      <div style="font-size:11px;margin-bottom:6px;">
         ${itemRows}
         ${globalDiscountRows}
       </div>
-
-      <hr/>
 
       <div style="font-size:12px;line-height:1.5;">
         <div class="rj"><span>Subtotal</span><span>Rs.${Math.round(subtotal)}</span></div>
@@ -531,7 +523,7 @@ function triggerReceiptPrint(cleanSaleId, timestamp, cartItems, subtotal, discou
     const cleanup = () => { clearTimeout(printTimeout); if (printWindow && !printWindow.isDestroyed()) printWindow.close(); };
 
     printWindow.webContents.on('did-finish-load', () => {
-      printWindow.webContents.print({ silent: true, printBackground: true }, () => cleanup());
+      printWindow.webContents.print({ silent: true, printBackground: true, margins: { marginType: 'none' },pageSize: { width: 80000, height: 297000 } }, () => cleanup());
     });
     printWindow.webContents.on('did-fail-load', () => cleanup());
     printWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(receiptHtml)}`);
@@ -654,20 +646,23 @@ ipcMain.handle('testServerConnection', async (event, { serverIp, serverPort }) =
       method: 'GET',
       timeout: 5000
     };
-
     const req = http.request(options, (res) => {
       let data = '';
       res.on('data', (chunk) => data += chunk);
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
-          resolve({ success: true, message: `Connected! Server version: ${parsed.version || '?'}` });
+          if (parsed.status === 'ok') {
+             resolve({ success: true, message: `Connected! Server version: ${parsed.version || '?'}` });
+          } else {
+             resolve({ success: false, message: 'Connected, but invalid API response.' });
+          }
         } catch (e) {
-          resolve({ success: true, message: 'Connected to server.' });
+          // ✅ FIX: Now properly fails if the device returns HTML instead of JSON
+          resolve({ success: false, message: 'Invalid response. Check if IP belongs to a router or wrong device.' });
         }
       });
     });
-
     req.on('error', (err) => resolve({ success: false, message: `Cannot reach server: ${err.message}` }));
     req.on('timeout', () => { req.destroy(); resolve({ success: false, message: 'Connection timed out. Check the IP and port.' }); });
     req.end();
@@ -1149,19 +1144,18 @@ function networkCall(method, endpoint, body, config) {
       timeout: 8000,
       headers: {
         'Content-Type': 'application/json',
-        ...(config.devPasswordHash ? {} : {}),
-        // Pass the raw dev password stored locally on the client
-        // We store it as plaintext on client (hashed only on server)
-        'x-pharmtrack-key': config.devPasswordPlain || ''
       }
     };
-
     if (bodyStr) options.headers['Content-Length'] = Buffer.byteLength(bodyStr);
 
     const req = http.request(options, (res) => {
       let data = '';
       res.on('data', (chunk) => data += chunk);
       res.on('end', () => {
+        // ✅ FIX: Reject immediately if the server returns an HTTP error code
+        if (res.statusCode >= 400) {
+          return reject(new Error(`Server returned HTTP ${res.statusCode}`));
+        }
         try {
           resolve(JSON.parse(data));
         } catch (e) {
@@ -1169,10 +1163,8 @@ function networkCall(method, endpoint, body, config) {
         }
       });
     });
-
     req.on('error', (err) => reject(new Error(`Server unreachable: ${err.message}`)));
     req.on('timeout', () => { req.destroy(); reject(new Error('Server connection timed out. Is the main PC on?')); });
-
     if (bodyStr) req.write(bodyStr);
     req.end();
   });

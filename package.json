@@ -18,6 +18,7 @@
     "bwip-js": "^4.11.1",
     "cors": "^2.8.6",
     "express": "^5.2.1",
+    "node-thermal-printer": "^4.6.0",
     "sqlite3": "^6.0.1"
   },
   "devDependencies": {
@@ -38,10 +39,13 @@
       "package.json",
       "frontend/dist/**/*"
     ],
-"extraResources": [
-  "pharmacy.db",
-  { "from": "frontend/src/assets/receipt-logo.png", "to": "assets/receipt-logo.png" }
-],
+    "extraResources": [
+      "pharmacy.db",
+      {
+        "from": "frontend/src/assets/receipt-logo.png",
+        "to": "assets/receipt-logo.png"
+      }
+    ],
     "win": {
       "target": "nsis",
       "icon": "frontend/src/assets/icon.ico"

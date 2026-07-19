@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 
-function StockManagement({ inventory, onAddNewStock, onDeleteStock, lightMode, scannedData, clearScannedData }) {
+function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteStock, lightMode, scannedData, clearScannedData }) {
   const currentDate = new Date();
   const currentYear = currentDate.getFullYear();
   const currentMonth = String(currentDate.getMonth() + 1).padStart(2, "0");
@@ -21,6 +21,12 @@ function StockManagement({ inventory, onAddNewStock, onDeleteStock, lightMode, s
 
   const [isEditMode, setIsEditMode] = useState(false);
   const [targetEditId, setTargetEditId] = useState(null);
+  // In-flight guards: without these a double-click created duplicate rows /
+  // double restocks, because every write here is non-idempotent.
+  const [isSavingStock, setIsSavingStock] = useState(false);
+  const [isRestocking, setIsRestocking] = useState(false);
+  // Timestamp of the last keydown, used to tell scanner bursts from real keys.
+  const lastKeyTimeRef = useRef(0);
 
   const [rowsPerPage, setRowsPerPage] = useState(10);
   const [currentPage, setCurrentPage] = useState(1);
@@ -148,9 +154,18 @@ function StockManagement({ inventory, onAddNewStock, onDeleteStock, lightMode, s
 
   useEffect(() => {
     const handleStockDialogKeys = (e) => {
+      // A barcode scanner types its payload and then sends Enter, all within a
+      // few milliseconds. A stray scan with the delete dialog open used to
+      // silently confirm the deletion, so ignore an Enter that arrives hot on
+      // the heels of another key — a human confirming has a much larger gap.
+      const now = Date.now();
+      const gapSinceLastKey = now - lastKeyTimeRef.current;
+      lastKeyTimeRef.current = now;
+
       if (deleteDialog.isOpen) {
         if (e.key === "Enter") {
           e.preventDefault();
+          if (gapSinceLastKey < 150) return; // scanner burst, not a confirmation
           if (deleteDialog.itemId) onDeleteStock(deleteDialog.itemId);
           setDeleteDialog({ isOpen: false, itemId: null, itemName: "" });
         } else if (e.key === "Escape") {
@@ -215,7 +230,7 @@ function StockManagement({ inventory, onAddNewStock, onDeleteStock, lightMode, s
   // ==========================================
   // QUICK-RESTOCK SUBMISSION
   // ==========================================
-  const handleQuickAddSubmit = (e) => {
+  const handleQuickAddSubmit = async (e) => {
     e.preventDefault();
     const item = quickAddDialog.targetItem;
     if (!item) return;
@@ -233,13 +248,16 @@ function StockManagement({ inventory, onAddNewStock, onDeleteStock, lightMode, s
       return;
     }
 
-    const updatedItem = {
-      ...item,
-      totalUnits: item.totalUnits + unitsToAdd
-    };
-
-    onAddNewStock(updatedItem, true); 
-    setQuickAddDialog({ isOpen: false, targetItem: null, addBoxes: "", addStrips: "" });
+    // Send a DELTA, never `snapshot + delta`. targetItem was frozen when the
+    // dialog opened; recomputing an absolute total from it wiped out any sale
+    // another till made in the meantime.
+    if (isRestocking) return;
+    setIsRestocking(true);
+    const ok = await onQuickRestock(item.id, unitsToAdd);
+    setIsRestocking(false);
+    if (ok) {
+      setQuickAddDialog({ isOpen: false, targetItem: null, addBoxes: "", addStrips: "" });
+    }
   };
 
   const handleTriggerEdit = (med) => {
@@ -279,8 +297,9 @@ function StockManagement({ inventory, onAddNewStock, onDeleteStock, lightMode, s
     });
   };
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
+    if (isSavingStock) return;
     if (!formData.name || !formData.batch || !formData.retailPrice || !formData.buyingPrice) {
       setValidationDialog({
         isOpen: true,
@@ -335,8 +354,15 @@ function StockManagement({ inventory, onAddNewStock, onDeleteStock, lightMode, s
       retailPrice: retailPriceRounded
     };
 
-    onAddNewStock(stockItemPayload, isEditMode);
-    handleCancelEdit();
+    // Only clear the form once the write is confirmed — it used to wipe
+    // immediately, so a failed save forced the user to retype everything.
+    setIsSavingStock(true);
+    try {
+      const ok = await onAddNewStock(stockItemPayload, isEditMode);
+      if (ok !== false) handleCancelEdit();
+    } finally {
+      setIsSavingStock(false);
+    }
   };
 
   const filteredInventory = inventory.filter((med) => {
@@ -450,8 +476,8 @@ function StockManagement({ inventory, onAddNewStock, onDeleteStock, lightMode, s
             </div>
 
             <div className="grid grid-cols-2 gap-3 mt-3">
-              <button type="button" onClick={() => setQuickAddDialog({ isOpen: false, targetItem: null, addBoxes: "", addStrips: "" })} className={`py-3 px-4 rounded-xl text-xs uppercase font-bold border ${lightMode ? "bg-slate-100 border-slate-200 text-slate-600 hover:bg-slate-200" : "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"}`}>Cancel</button>
-              <button type="submit" className="w-full bg-gradient-to-r from-emerald-500 to-teal-500 text-white font-black py-3 rounded-xl text-xs uppercase tracking-wider shadow-md hover:opacity-90 transition-opacity">Confirm Stock</button>
+              <button type="button" disabled={isRestocking} onClick={() => setQuickAddDialog({ isOpen: false, targetItem: null, addBoxes: "", addStrips: "" })} className={`py-3 px-4 rounded-xl text-xs uppercase font-bold border disabled:opacity-40 disabled:pointer-events-none ${lightMode ? "bg-slate-100 border-slate-200 text-slate-600 hover:bg-slate-200" : "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"}`}>Cancel</button>
+              <button type="submit" disabled={isRestocking} className="w-full bg-gradient-to-r from-emerald-500 to-teal-500 text-white font-black py-3 rounded-xl text-xs uppercase tracking-wider shadow-md hover:opacity-90 transition-opacity disabled:opacity-50 disabled:pointer-events-none">{isRestocking ? "Adding..." : "Confirm Stock"}</button>
             </div>
           </form>
         </div>
@@ -572,8 +598,8 @@ function StockManagement({ inventory, onAddNewStock, onDeleteStock, lightMode, s
             ) : (
               <button type="button" onClick={() => setFormData({ barcode: "", name: "", generic: "", batch: "", expiry: "", boxes: "", strips: "", factor: 2, buyingPrice: "", retailPrice: "" })} className={`font-bold py-3 rounded-xl text-xs uppercase transition-colors border ${lightMode ? "bg-slate-100 border-slate-200 text-slate-600 hover:bg-slate-200" : "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"}`}>Clear Form</button>
             )}
-            <button type="submit" className={`font-black py-3 rounded-xl text-xs uppercase shadow-md transition-all ${isEditMode ? "bg-gradient-to-r from-amber-400 to-orange-400 text-slate-900" : "bg-gradient-to-r from-emerald-500 to-teal-500 text-white"}`}>
-              {isEditMode ? "Save Edits" : "Log Stock"}
+            <button type="submit" disabled={isSavingStock} className={`font-black py-3 rounded-xl text-xs uppercase shadow-md transition-all disabled:opacity-50 disabled:pointer-events-none ${isEditMode ? "bg-gradient-to-r from-amber-400 to-orange-400 text-slate-900" : "bg-gradient-to-r from-emerald-500 to-teal-500 text-white"}`}>
+              {isSavingStock ? "Saving..." : isEditMode ? "Save Edits" : "Log Stock"}
             </button>
           </div>
         </form>

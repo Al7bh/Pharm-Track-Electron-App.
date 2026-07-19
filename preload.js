@@ -16,12 +16,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   updateInventory: (updatedItem) => ipcRenderer.invoke('updateInventory', updatedItem),
   searchInventory: (query) => ipcRenderer.invoke('searchInventory', query),
   deleteInventory: (itemId) => ipcRenderer.invoke('deleteInventory', itemId),
+  // Relative "add N units" — safe against concurrent sales from other tills.
+  restockInventory: (payload) => ipcRenderer.invoke('restockInventory', payload),
 
   // Sales & History
   getSalesHistory: () => ipcRenderer.invoke('getSalesHistory'),
   processCheckout: (payload) => ipcRenderer.invoke('process-checkout', payload),
   searchSalesHistory: (query) => ipcRenderer.invoke('searchSalesHistory', query),
   returnSaleItem: (payload) => ipcRenderer.invoke('returnSaleItem', payload),
+  // Pass a saleId to reprint that invoice, or omit it for the last sale.
+  reprintReceipt: (saleId) => ipcRenderer.invoke('reprintReceipt', saleId),
 
   // ─── Developer / Network Configuration ────────────────────────────────────
   // These are only accessible through the hidden 7-tap developer screen.
@@ -29,6 +33,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   verifyDevPassword: (password) => ipcRenderer.invoke('verifyDevPassword', password),
   saveSystemConfig: (payload) => ipcRenderer.invoke('saveSystemConfig', payload),
   testServerConnection: (payload) => ipcRenderer.invoke('testServerConnection', payload),
+  generateApiToken: () => ipcRenderer.invoke('generateApiToken'),
   restartApp: () => ipcRenderer.invoke('restartApp'),
 
   // ─── Backup & Restore ─────────────────────────────────────────────────────

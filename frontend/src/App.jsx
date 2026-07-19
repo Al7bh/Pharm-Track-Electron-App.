@@ -104,7 +104,16 @@ function App() {
     // always the real value from disk, not a stale React snapshot.
     if (!window.electronAPI || !window.electronAPI.getSystemConfig) return;
 
+    // The interval used to be created inside the .then(), so its cleanup was
+    // returned to the promise instead of to React — every login/logout leaked
+    // another heartbeat that pinged forever. These two handles let the real
+    // cleanup below cancel whatever the async work started.
+    let interval = null;
+    let cancelled = false;
+
     window.electronAPI.getSystemConfig().then((config) => {
+      if (cancelled) return;
+
       // Standalone or server machines are always "online" — no ping needed.
       if (!config || config.mode !== 'client') {
         setServerStatus('online');
@@ -118,16 +127,26 @@ function App() {
       const ping = async () => {
         try {
           const res = await window.electronAPI.checkServerStatus();
+          if (cancelled) return;
           setServerStatus(res && res.status === 'busy' ? 'busy' : res && res.status === 'online' ? 'online' : 'offline');
         } catch {
-          setServerStatus('offline');
+          if (!cancelled) setServerStatus('offline');
         }
       };
 
       ping();
-      const interval = setInterval(ping, 5000);
-      return () => clearInterval(interval);
+      interval = setInterval(ping, 5000);
+    }).catch((err) => {
+      // Without this the promise rejected unhandled and the badge stayed on a
+      // confident green "Online" forever.
+      console.error('Could not read system config:', err);
+      if (!cancelled) setServerStatus('offline');
     });
+
+    return () => {
+      cancelled = true;
+      if (interval) clearInterval(interval);
+    };
   }, [isAuthenticated]); // re-runs when user logs in/out
   const [isEarningAuthenticated, setIsEarningAuthenticated] = useState(false);
   const [earningPinInput, setEarningPinInput] = useState("");
@@ -169,7 +188,7 @@ function App() {
     error: '',
   });
   const [sysConfig, setSysConfig] = useState(null);
-  const [configForm, setConfigForm] = useState({ mode: 'server', serverIp: '', serverPort: '3847', newDevPassword: '' });
+  const [configForm, setConfigForm] = useState({ mode: 'server', serverIp: '', serverPort: '3847', newDevPassword: '', apiToken: '' });
   const [connectionTest, setConnectionTest] = useState({ result: '', type: '' });
   const [isSavingConfig, setIsSavingConfig] = useState(false);
   const [lastBackupPath, setLastBackupPath] = useState('');
@@ -196,7 +215,8 @@ function App() {
         mode: config.mode,
         serverIp: config.serverIp,
         serverPort: config.serverPort,
-        newDevPassword: ''
+        newDevPassword: '',
+        apiToken: config.apiToken || ''
       });
       setDevScreen(s => ({ ...s, showPrompt: false, showConfig: true, isFirstTime: res.firstTime || false, error: '' }));
     } else {
@@ -223,7 +243,8 @@ function App() {
     setConnectionTest({ result: 'Testing...', type: 'info' });
     const res = await window.electronAPI.testServerConnection({
       serverIp: configForm.serverIp,
-      serverPort: configForm.serverPort
+      serverPort: configForm.serverPort,
+      apiToken: configForm.apiToken
     });
     setConnectionTest({ result: res.message, type: res.success ? 'success' : 'error' });
   };
@@ -245,6 +266,27 @@ function App() {
       setTimeout(() => window.electronAPI.restartApp(), 2000);
     } else {
       showNotification('Restore Failed', res.message, 'error');
+    }
+  };
+
+  // Reprints the most recent sale — handy for testing the thermal printer
+  // without having to ring up a real transaction.
+  const [isReprintingLast, setIsReprintingLast] = useState(false);
+  const handleDevReprintLast = async () => {
+    if (isReprintingLast) return;
+    if (!window.electronAPI || !window.electronAPI.reprintReceipt) return;
+    setIsReprintingLast(true);
+    try {
+      const res = await window.electronAPI.reprintReceipt();
+      if (res && res.success) {
+        showNotification('Receipt Sent', `Last receipt (INV-${res.saleId}) sent to the printer.`, 'success');
+      } else {
+        showNotification('Reprint Failed', (res && res.message) || 'Could not reprint the last receipt.', 'error');
+      }
+    } catch (err) {
+      showNotification('Reprint Failed', err.message || 'Printer or server unreachable.', 'error');
+    } finally {
+      setIsReprintingLast(false);
     }
   };
 
@@ -271,17 +313,18 @@ function App() {
   }, []);
 
   useEffect(() => {
-    // Initial fetch when the app opens
+    // Initial fetch when the app opens. Surfaces a real error if it fails,
+    // because at this point the user has no data at all.
     refreshStockLedger();
     refreshSalesHistory();
 
-    // Background sync: Fetch the latest data from the server every 10 seconds
+    // Background sync every 5s. Silent: a transient network blip must not
+    // interrupt a cashier mid-sale with a blocking modal.
     const syncInterval = setInterval(() => {
-      refreshStockLedger();
-      refreshSalesHistory();
-    }, 5000); // 5000 milliseconds = 5 seconds
+      refreshStockLedger({ silent: true });
+      refreshSalesHistory({ silent: true });
+    }, 5000);
 
-    // Cleanup the interval if the component unmounts
     return () => clearInterval(syncInterval);
   }, []);
 
@@ -413,20 +456,48 @@ function App() {
   const closeNotification = () =>
     setNotification((prev) => ({ ...prev, isOpen: false }));
 
-const refreshStockLedger = () => {
-    if (window.electronAPI && window.electronAPI.getInventory) {
-      window.electronAPI.getInventory()
-        .then((data) => setInventory(data))
-        .catch((err) => showNotification("Database Error", "Failed to load inventory ledger.", "error"));
-    }
+  // Sequence guards: the 5s poll fires regardless of whether the previous
+  // request is still in flight. Over the network a slow response could land
+  // AFTER a newer one and drag the UI backwards — including undoing the
+  // post-checkout refresh, which made a completed sale look like it failed.
+  // Only the newest request for each dataset is allowed to write state.
+  const inventorySeqRef = useRef(0);
+  const salesSeqRef = useRef(0);
+
+  // `silent` is used by the background poll: a failing poll must never raise a
+  // modal. It used to throw a blocking, full-screen error every 5 seconds
+  // (twice — once per refresher), which bricked the app whenever the server
+  // PC slept. The nav status indicator is the right place to show this.
+  const refreshStockLedger = ({ silent = false } = {}) => {
+    if (!window.electronAPI || !window.electronAPI.getInventory) return;
+    const seq = ++inventorySeqRef.current;
+    window.electronAPI.getInventory()
+      .then((data) => {
+        if (seq !== inventorySeqRef.current) return; // a newer request already answered
+        setInventory(data);
+      })
+      .catch((err) => {
+        if (seq !== inventorySeqRef.current) return;
+        console.error("Inventory refresh failed:", err);
+        setServerStatus("offline");
+        if (!silent) showNotification("Database Error", err.message || "Failed to load inventory ledger.", "error");
+      });
   };
 
-  const refreshSalesHistory = () => {
-    if (window.electronAPI && window.electronAPI.getSalesHistory) {
-      window.electronAPI.getSalesHistory()
-        .then((data) => setSalesHistory(data))
-        .catch((err) => showNotification("Database Error", "Failed to load sales history.", "error"));
-    }
+  const refreshSalesHistory = ({ silent = false } = {}) => {
+    if (!window.electronAPI || !window.electronAPI.getSalesHistory) return;
+    const seq = ++salesSeqRef.current;
+    window.electronAPI.getSalesHistory()
+      .then((data) => {
+        if (seq !== salesSeqRef.current) return;
+        setSalesHistory(data);
+      })
+      .catch((err) => {
+        if (seq !== salesSeqRef.current) return;
+        console.error("Sales history refresh failed:", err);
+        setServerStatus("offline");
+        if (!silent) showNotification("Database Error", err.message || "Failed to load sales history.", "error");
+      });
   };
 
   const handleMagicScanSale = (dbProduct) => {
@@ -542,20 +613,52 @@ const refreshStockLedger = () => {
     }
   };
 
+  // Returns true only when the write actually succeeded, so the form knows
+  // whether it is safe to clear itself.
   const handleSaveStockToDB = async (itemData, isEditMode) => {
-    if (window.electronAPI) {
-      try {
-        if (isEditMode && window.electronAPI.updateInventory) {
-          await window.electronAPI.updateInventory(itemData);
-          showNotification("Success", "Product profile updated successfully!", "success");
-        } else if (window.electronAPI.addInventory) {
-          await window.electronAPI.addInventory(itemData);
-          showNotification("Success", "New stock recorded into database!", "success");
-        }
-        refreshStockLedger();
-      } catch (err) {
-        showNotification("Stock Update Failed", err.message || "Database rejected the stock update.", "error");
+    if (!window.electronAPI) return false;
+    try {
+      let res;
+      if (isEditMode && window.electronAPI.updateInventory) {
+        res = await window.electronAPI.updateInventory(itemData);
+      } else if (window.electronAPI.addInventory) {
+        res = await window.electronAPI.addInventory(itemData);
+      } else {
+        return false;
       }
+
+      // Some handlers resolve {success:false, message} with HTTP 200 rather
+      // than rejecting — don't report those as a success.
+      if (res && res.success === false) {
+        showNotification("Stock Update Failed", res.message || "Database rejected the stock update.", "error");
+        return false;
+      }
+
+      showNotification(
+        "Success",
+        isEditMode ? "Product profile updated successfully!" : "New stock recorded into database!",
+        "success"
+      );
+      refreshStockLedger();
+      return true;
+    } catch (err) {
+      showNotification("Stock Update Failed", err.message || "Database rejected the stock update.", "error");
+      return false;
+    }
+  };
+
+  // Quick Restock sends a DELTA, not a recomputed absolute total, so a restock
+  // based on a stale poll can no longer erase another till's sale.
+  const handleQuickRestock = async (itemId, unitsToAdd) => {
+    if (!window.electronAPI || !window.electronAPI.restockInventory) return false;
+    try {
+      await window.electronAPI.restockInventory({ id: itemId, unitsToAdd });
+      showNotification("Stock Added", "Units credited to the existing batch.", "success");
+      refreshStockLedger();
+      return true;
+    } catch (err) {
+      showNotification("Restock Failed", err.message || "Database rejected the restock.", "error");
+      return false;
     }
   };
 
@@ -728,10 +831,14 @@ const refreshStockLedger = () => {
           setAttempts(0);
           setAuthError("");
         } else {
-          // NEW: Catch the backend lockout message if they bypassed via F5
-          if (res.message.includes("permanently locked")) {
+          // res.message can be absent, so never call .includes() on it directly.
+          const message = res.message || "Invalid administrative terminal credentials.";
+
+          // Catch the backend lockout message if they bypassed via F5, or the
+          // server's HTTP rate limiter.
+          if (message.includes("permanently locked") || message.includes("Too many failed attempts")) {
             setAttempts(3);
-            setAuthError(res.message);
+            setAuthError(message);
             return;
           }
 
@@ -740,11 +847,11 @@ const refreshStockLedger = () => {
           if (newAttempts >= 3) {
             setAuthError("Account locked. Please restart the app.");
           } else {
-            setAuthError(`${res.message}. Attempts remaining: ${3 - newAttempts}`);
+            setAuthError(`${message}. Attempts remaining: ${3 - newAttempts}`);
           }
         }
       } catch (err) {
-        setAuthError("Authentication service connection failed.");
+        setAuthError(err.message || "Authentication service connection failed.");
       }
     }
   };
@@ -762,21 +869,24 @@ const refreshStockLedger = () => {
           setIsEarningAuthenticated(true);
           setVaultAttempts(0); // Reset on success just in case
         } else {
-          // NEW: Catch the backend lockout message if they bypassed via F5
-          if (res.message.includes("permanently locked")) {
-             setVaultAttempts(3);
-             setPassMessage({ text: res.message, type: "error" }); // Or setAuthError depending on your state name
-             return;
+          // res.message can be absent (or the server may be rate-limiting), so
+          // never call .includes() on it directly.
+          const message = res.message || "Invalid master vault PIN.";
+
+          // Catch the backend lockout message if they bypassed via F5
+          if (message.includes("permanently locked") || message.includes("Too many failed attempts")) {
+            setVaultAttempts(3);
+            showNotification("Vault Locked", message, "error");
+            return;
           }
 
           const newAttempts = vaultAttempts + 1;
           setVaultAttempts(newAttempts);
-          
-          // Use your respective error state here (setPassMessage, showNotification, etc.)
-          showNotification("Security Violation", 
-            newAttempts >= 3 
-              ? "Vault access permanently locked for this session." 
-              : `${res.message}. Attempts remaining: ${3 - newAttempts}`, 
+
+          showNotification("Security Violation",
+            newAttempts >= 3
+              ? "Vault access permanently locked for this session."
+              : `${message}. Attempts remaining: ${3 - newAttempts}`,
             "error"
           );
         }
@@ -1025,6 +1135,36 @@ const refreshStockLedger = () => {
                   </div>
                 )}
 
+                {/* API security token — must match on server + every client */}
+                <div>
+                  <label className="text-[10px] font-black uppercase tracking-wider text-slate-500 block mb-1">Network Security Token</label>
+                  <div className="flex gap-2">
+                    <input type="text" placeholder="Not set — API is open to the network!"
+                      value={configForm.apiToken}
+                      onChange={(e) => setConfigForm(f => ({ ...f, apiToken: e.target.value }))}
+                      className="flex-1 min-w-0 bg-slate-50 border border-slate-200 rounded-xl py-2.5 px-3 text-[11px] font-mono focus:outline-none focus:border-violet-500 text-slate-900" />
+                    <button type="button"
+                      onClick={async () => {
+                        const t = await window.electronAPI.generateApiToken();
+                        setConfigForm(f => ({ ...f, apiToken: t }));
+                      }}
+                      className="bg-slate-100 text-slate-700 font-bold py-2 px-3 rounded-xl text-[10px] uppercase tracking-wider hover:bg-slate-200 shrink-0">
+                      Generate
+                    </button>
+                    <button type="button"
+                      onClick={() => navigator.clipboard?.writeText(configForm.apiToken || '')}
+                      disabled={!configForm.apiToken}
+                      className="bg-slate-100 text-slate-700 font-bold py-2 px-3 rounded-xl text-[10px] uppercase tracking-wider hover:bg-slate-200 shrink-0 disabled:opacity-40">
+                      Copy
+                    </button>
+                  </div>
+                  {configForm.apiToken ? (
+                    <p className="text-[10px] text-slate-400 mt-1">Paste this exact token into every client machine's developer screen, or they won't be able to connect.</p>
+                  ) : (
+                    <p className="text-[10px] text-rose-500 mt-1 font-medium">⚠ Without a token, any device on the pharmacy WiFi can read your data and post fake sales. Generate one on the server, then copy it to each client.</p>
+                  )}
+                </div>
+
                 {/* Developer password */}
                 <div>
                   <label className="text-[10px] font-black uppercase tracking-wider text-slate-500 block mb-1">
@@ -1053,6 +1193,17 @@ const refreshStockLedger = () => {
                     </button>
                   </div>
                   <p className="text-[10px] text-rose-500 mt-1.5 font-medium">⚠ Import replaces ALL current data. A safety copy is made automatically first.</p>
+                </div>
+
+                {/* Printer tools */}
+                <div className="border-t pt-4 border-slate-100">
+                  <label className="text-[10px] font-black uppercase tracking-wider text-slate-500 block mb-2">Printer Test</label>
+                  <button type="button" onClick={handleDevReprintLast} disabled={isReprintingLast}
+                    className="w-full border border-slate-200 text-slate-600 font-bold py-2.5 rounded-xl text-[10px] uppercase tracking-wider hover:bg-slate-50 disabled:opacity-50 flex items-center justify-center gap-1.5">
+                    <span className="material-symbols-outlined text-sm">print</span>
+                    {isReprintingLast ? 'Sending...' : 'Reprint Last Receipt'}
+                  </button>
+                  <p className="text-[10px] text-slate-400 mt-1.5">Reprints the most recent sale on the server's thermal printer — use this to test the printer without making a sale.</p>
                 </div>
 
                 {/* Save */}
@@ -1389,7 +1540,7 @@ const refreshStockLedger = () => {
               <div className="flex-1 overflow-y-auto p-4 md:p-6 custom-scrollbar h-full min-h-0">
                 {activeProducts.length > 0 ? (
                   <div className="flex flex-col gap-4 w-full h-fit max-w-4xl mx-auto">
-                    {activeProducts.map((product) => (
+                    {activeProducts.map((product, index) => (
                       <SalesCounter
                         key={product.id || `active-card-${index}`}
                         activeProduct={product}
@@ -1454,7 +1605,7 @@ const refreshStockLedger = () => {
                         </p>
                       </div>
                     ) : (
-                      cart.map((item) => (
+                      cart.map((item, index) => (
                         <div
                           key={item.id || `cart-item-${index}`}
                           className={`border rounded-xl p-3 flex flex-col gap-2 shadow-sm transition-all ${lightMode ? "bg-white border-slate-200 hover:border-slate-300" : "bg-slate-900/80 border-slate-800 hover:border-slate-700"}`}
@@ -1693,6 +1844,7 @@ const refreshStockLedger = () => {
               <StockManagement
                 inventory={inventory}
                 onAddNewStock={handleSaveStockToDB}
+                onQuickRestock={handleQuickRestock}
                 onDeleteStock={handleDeleteStockFromDB}
                 lightMode={lightMode}
                 scannedData={scannedInventoryData}
@@ -1708,6 +1860,7 @@ const refreshStockLedger = () => {
                   refreshStockLedger();
                   refreshSalesHistory();
                 }}
+                onNotify={showNotification}
                 scannedInvoiceId={scannedInvoiceId}
                 clearScannedInvoice={() => setScannedInvoiceId(null)}
               />

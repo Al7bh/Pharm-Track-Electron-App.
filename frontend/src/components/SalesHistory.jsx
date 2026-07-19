@@ -6,9 +6,12 @@ function SalesHistory({
   lightMode,
   scannedInvoiceId,
   clearScannedInvoice,
+  onNotify,
 }) {
   const [historyQuery, setHistoryQuery] = useState("");
   const [displayHistory, setDisplayHistory] = useState(salesHistory);
+  const [isReprinting, setIsReprinting] = useState(false);
+  const [isReturning, setIsReturning] = useState(false);
 
   const [rowsPerPage, setRowsPerPage] = useState(10);
   const [currentPage, setCurrentPage] = useState(1);
@@ -23,11 +26,26 @@ function SalesHistory({
   });
 
   useEffect(() => {
-    setDisplayHistory(salesHistory);
-    setCurrentPage(1);
+    // The 5s poll hands us a brand-new array every time. Blindly adopting it
+    // used to wipe an active search (showing ALL invoices under a search box
+    // still reading "INV-4471") and snap the user back to page 1 mid-paging —
+    // which meant clicking "the row my result was on" opened the return modal
+    // on the WRONG invoice. Only sync when the user isn't searching.
+    if (historyQuery.trim() === "") {
+      setDisplayHistory(salesHistory);
+    }
+
+    // Keep the open inspector/return modal pointed at fresh data, so a return
+    // is never computed from a snapshot another till has already changed.
     if (selectedInvoice) {
       const updatedInvoice = salesHistory.find((s) => s.id === selectedInvoice.id);
       setSelectedInvoice(updatedInvoice || null);
+      setReturnModal((prev) => {
+        if (!prev.isOpen || !prev.sale) return prev;
+        const freshSale = salesHistory.find((s) => s.id === prev.sale.id);
+        if (!freshSale) return prev;
+        return { ...prev, sale: freshSale };
+      });
     }
   }, [salesHistory]);
 
@@ -59,6 +77,27 @@ function SalesHistory({
     if (window.electronAPI && window.electronAPI.searchSalesHistory) {
       const liveHistoryRows = await window.electronAPI.searchSalesHistory(val);
       setDisplayHistory(liveHistoryRows);
+    }
+  };
+
+  // Reprint the selected invoice. Printing always happens on the server PC
+  // (that's where the thermal printer is), so a client just asks the server.
+  const handleReprintInvoice = async () => {
+    if (!selectedInvoice || isReprinting) return;
+    if (!window.electronAPI || !window.electronAPI.reprintReceipt) return;
+
+    setIsReprinting(true);
+    try {
+      const res = await window.electronAPI.reprintReceipt(selectedInvoice.id);
+      if (res && res.success) {
+        if (onNotify) onNotify("Receipt Sent", `Invoice INV-${res.saleId} was sent to the printer.`, "success");
+      } else {
+        if (onNotify) onNotify("Reprint Failed", (res && res.message) || "Could not reprint this receipt.", "error");
+      }
+    } catch (err) {
+      if (onNotify) onNotify("Reprint Failed", err.message || "Printer or server unreachable.", "error");
+    } finally {
+      setIsReprinting(false);
     }
   };
 
@@ -119,6 +158,12 @@ function SalesHistory({
     e.preventDefault();
     const { sale, item, quantity } = returnModal;
     if (!window.electronAPI || !window.electronAPI.returnSaleItem) return;
+
+    // The backend restock is relative (totalUnits + ?) and mints a fresh RET-
+    // row per call, so a double-click refunded and restocked twice. Pressing
+    // Enter in the quantity field submits too, which made this trivial to hit.
+    if (isReturning) return;
+    setIsReturning(true);
 
     try {
       if (item === null) {
@@ -212,20 +257,30 @@ function SalesHistory({
       }
     } catch (err) {
       console.error("Return failed:", err);
-      alert(`SYSTEM ERROR: Return processing failed.\nReason: ${err.message || 'Database lock or write error.'}`);
+      if (onNotify) {
+        onNotify("Return Failed", err.message || "Database lock or write error.", "error");
+      } else {
+        alert(`SYSTEM ERROR: Return processing failed.\nReason: ${err.message || 'Database lock or write error.'}`);
+      }
+    } finally {
+      setIsReturning(false);
     }
   };
 
   const cashierVisibleHistory = displayHistory.filter(sale => !sale.id.startsWith("RET-"));
   const totalFilteredRows = cashierVisibleHistory.length;
   const totalPagesCount = Math.ceil(totalFilteredRows / rowsPerPage) || 1;
-  const indexLastRow = currentPage * rowsPerPage;
+  // The poll no longer forces us back to page 1, so clamp instead: if rows
+  // disappear (a return deleted an invoice) the current page could otherwise
+  // fall past the end and render an empty table.
+  const safePage = Math.min(currentPage, totalPagesCount);
+  const indexLastRow = safePage * rowsPerPage;
   const indexFirstRow = indexLastRow - rowsPerPage;
   const paginatedSalesSlice = cashierVisibleHistory.slice(indexFirstRow, indexLastRow);
 
   const handlePageChange = (direction) => {
-    if (direction === "next" && currentPage < totalPagesCount) setCurrentPage((prev) => prev + 1);
-    else if (direction === "prev" && currentPage > 1) setCurrentPage((prev) => prev - 1);
+    if (direction === "next" && safePage < totalPagesCount) setCurrentPage(safePage + 1);
+    else if (direction === "prev" && safePage > 1) setCurrentPage(safePage - 1);
   };
 
   const extractItems = (jsonStr) => {
@@ -301,11 +356,11 @@ function SalesHistory({
             )}
 
             <div className="grid grid-cols-2 gap-3 pt-2">
-              <button type="button" onClick={handleCloseReturnModal} className={`w-full font-bold py-2.5 rounded-xl text-xs uppercase tracking-wider transition-colors border ${lightMode ? "bg-slate-100 border-slate-200 text-slate-700 hover:bg-slate-200" : "bg-slate-800 hover:bg-slate-700 text-white border-slate-700"}`}>
+              <button type="button" onClick={handleCloseReturnModal} disabled={isReturning} className={`w-full font-bold py-2.5 rounded-xl text-xs uppercase tracking-wider transition-colors border disabled:opacity-40 disabled:pointer-events-none ${lightMode ? "bg-slate-100 border-slate-200 text-slate-700 hover:bg-slate-200" : "bg-slate-800 hover:bg-slate-700 text-white border-slate-700"}`}>
                 Cancel
               </button>
-              <button type="submit" className={`w-full text-slate-950 font-black py-2.5 rounded-xl text-xs uppercase tracking-wider shadow-lg hover:opacity-90 transition-opacity ${returnModal.item === null ? "bg-gradient-to-r from-rose-500 to-red-500" : "bg-gradient-to-r from-amber-400 to-orange-400"}`}>
-                Confirm Return
+              <button type="submit" disabled={isReturning} className={`w-full text-slate-950 font-black py-2.5 rounded-xl text-xs uppercase tracking-wider shadow-lg hover:opacity-90 transition-opacity disabled:opacity-50 disabled:pointer-events-none ${returnModal.item === null ? "bg-gradient-to-r from-rose-500 to-red-500" : "bg-gradient-to-r from-amber-400 to-orange-400"}`}>
+                {isReturning ? "Processing..." : "Confirm Return"}
               </button>
             </div>
           </form>
@@ -401,11 +456,11 @@ function SalesHistory({
             Showing <span className="font-bold text-slate-500">{totalFilteredRows === 0 ? 0 : indexFirstRow + 1}</span> - <span className="font-bold text-slate-500">{Math.min(indexLastRow, totalFilteredRows)}</span> of <span className="font-bold text-slate-500">{totalFilteredRows}</span> invoices
           </div>
           <div className="flex items-center gap-2">
-            <button type="button" disabled={currentPage === 1} onClick={() => handlePageChange("prev")} className={`w-8 h-8 rounded-xl flex items-center justify-center border font-black transition-all disabled:opacity-20 disabled:pointer-events-none ${lightMode ? "bg-white border-slate-200 hover:bg-slate-100" : "bg-slate-900 border-slate-700 text-slate-300 hover:bg-slate-800"}`}>
+            <button type="button" disabled={safePage === 1} onClick={() => handlePageChange("prev")} className={`w-8 h-8 rounded-xl flex items-center justify-center border font-black transition-all disabled:opacity-20 disabled:pointer-events-none ${lightMode ? "bg-white border-slate-200 hover:bg-slate-100" : "bg-slate-900 border-slate-700 text-slate-300 hover:bg-slate-800"}`}>
               <span className="material-symbols-outlined text-base">chevron_left</span>
             </button>
-            <span className="font-mono font-bold px-2 text-slate-400">Page {currentPage} / {totalPagesCount}</span>
-            <button type="button" disabled={currentPage === totalPagesCount} onClick={() => handlePageChange("next")} className={`w-8 h-8 rounded-xl flex items-center justify-center border font-black transition-all disabled:opacity-20 disabled:pointer-events-none ${lightMode ? "bg-white border-slate-200 hover:bg-slate-100" : "bg-slate-900 border-slate-700 text-slate-300 hover:bg-slate-800"}`}>
+            <span className="font-mono font-bold px-2 text-slate-400">Page {safePage} / {totalPagesCount}</span>
+            <button type="button" disabled={safePage === totalPagesCount} onClick={() => handlePageChange("next")} className={`w-8 h-8 rounded-xl flex items-center justify-center border font-black transition-all disabled:opacity-20 disabled:pointer-events-none ${lightMode ? "bg-white border-slate-200 hover:bg-slate-100" : "bg-slate-900 border-slate-700 text-slate-300 hover:bg-slate-800"}`}>
               <span className="material-symbols-outlined text-base">chevron_right</span>
             </button>
           </div>
@@ -500,8 +555,22 @@ function SalesHistory({
             
             <button
               type="button"
+              onClick={handleReprintInvoice}
+              disabled={isReprinting}
+              className={`w-full font-black py-3 rounded-xl text-xs uppercase tracking-wider shadow-sm mt-2 flex items-center justify-center gap-2 border transition-all disabled:opacity-50 disabled:pointer-events-none ${
+                lightMode
+                  ? "bg-white border-slate-200 text-slate-700 hover:border-emerald-500 hover:text-emerald-600"
+                  : "bg-slate-900 border-slate-700 text-slate-300 hover:border-emerald-500 hover:text-emerald-400"
+              }`}
+            >
+              <span className="material-symbols-outlined text-base font-black">print</span>
+              <span>{isReprinting ? "Sending to printer..." : "Reprint This Receipt"}</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => handleOpenFullBillReturnModal(selectedInvoice)}
-              className="w-full bg-gradient-to-r from-rose-500 to-red-500 text-slate-950 font-black py-3.5 rounded-xl text-xs uppercase tracking-wider shadow-md hover:opacity-90 mt-2 flex items-center justify-center gap-2"
+              className="w-full bg-gradient-to-r from-rose-500 to-red-500 text-slate-950 font-black py-3.5 rounded-xl text-xs uppercase tracking-wider shadow-md hover:opacity-90 flex items-center justify-center gap-2"
             >
               <span className="material-symbols-outlined text-base font-black">delete_sweep</span>
               <span>Return Whole Invoice Bill</span>

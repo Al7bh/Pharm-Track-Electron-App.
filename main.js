@@ -1222,7 +1222,9 @@ ipcMain.handle('checkServerStatus', async () => {
       path: '/api/status',
       method: 'GET',
       timeout: 4000,
+      headers: {},
     };
+    if (sysConfig.apiToken) options.headers['x-api-token'] = sysConfig.apiToken;
     const req = http.request(options, (res) => {
       let data = '';
       res.on('data', (chunk) => data += chunk);

@@ -29,3 +29,6 @@ desktop.ini
 # Environment files
 .env
 .env.local
+
+#Other
+TODO.md

@@ -475,6 +475,7 @@ function App() {
       .then((data) => {
         if (seq !== inventorySeqRef.current) return; // a newer request already answered
         setInventory(data);
+        setServerStatus("online"); // data fetch succeeded — server is reachable
       })
       .catch((err) => {
         if (seq !== inventorySeqRef.current) return;
@@ -491,6 +492,7 @@ function App() {
       .then((data) => {
         if (seq !== salesSeqRef.current) return;
         setSalesHistory(data);
+        setServerStatus("online"); // data fetch succeeded — server is reachable
       })
       .catch((err) => {
         if (seq !== salesSeqRef.current) return;
@@ -917,31 +919,40 @@ function App() {
 
   if (!isAuthenticated) {
     return (
-      <div className="bg-slate-100 text-slate-900 min-h-screen w-full flex items-center justify-center relative overflow-hidden select-none font-sans antialiased">
-        <div className="absolute inset-0 bg-[linear-gradient(to_right,#e2e8f0_1px,transparent_1px),linear-gradient(to_bottom,#e2e8f0_1px,transparent_1px)] bg-[size:4rem_4rem] opacity-80 pointer-events-none" />
-        <div className="max-w-md w-full px-6 z-10 flex flex-col gap-8">
+      <div className={`${lightMode ? "bg-gradient-to-br from-slate-50 via-white to-emerald-50" : "bg-gradient-to-br from-slate-950 via-slate-900 to-indigo-950"} min-h-screen w-full flex items-center justify-center relative overflow-hidden select-none font-sans antialiased`}>
+        {/* Animated gradient orbs background */}
+        <div className="absolute inset-0 bg-[length:200%_200%] animate-gradient-shift" style={{
+          backgroundImage: lightMode
+            ? 'radial-gradient(ellipse at 20% 50%, rgba(16,185,129,0.08) 0%, transparent 50%), radial-gradient(ellipse at 80% 20%, rgba(5,150,105,0.05) 0%, transparent 50%), radial-gradient(ellipse at 50% 80%, rgba(16,185,129,0.06) 0%, transparent 50%)'
+            : 'radial-gradient(ellipse at 20% 50%, rgba(16,185,129,0.15) 0%, transparent 50%), radial-gradient(ellipse at 80% 20%, rgba(99,102,241,0.10) 0%, transparent 50%), radial-gradient(ellipse at 50% 80%, rgba(16,185,129,0.12) 0%, transparent 50%)'
+        }} />
+        {/* Floating decorative orbs */}
+        <div className={`absolute top-20 left-[10%] w-72 h-72 rounded-full opacity-20 blur-3xl pointer-events-none ${lightMode ? "bg-emerald-300" : "bg-emerald-500/20"}`} style={{ animation: 'float-slow 6s ease-in-out infinite' }} />
+        <div className={`absolute bottom-20 right-[10%] w-96 h-96 rounded-full opacity-20 blur-3xl pointer-events-none ${lightMode ? "bg-teal-300" : "bg-teal-500/20"}`} style={{ animation: 'float-medium 8s ease-in-out infinite' }} />
+        <div className={`absolute top-1/3 right-[15%] w-48 h-48 rounded-full opacity-10 blur-3xl pointer-events-none ${lightMode ? "bg-emerald-400" : "bg-indigo-500/20"}`} style={{ animation: 'float-fast 10s ease-in-out infinite' }} />
+        <div className="max-w-md w-full px-6 z-10 flex flex-col gap-8 animate-fade-in-up">
           <div className="flex flex-col items-center text-center gap-3">
-            <div className="w-14 h-14 bg-white border border-slate-200 rounded-2xl flex items-center justify-center text-emerald-500 shadow-md">
+            <div className={`w-14 h-14 ${lightMode ? "bg-white/90 border-slate-200 shadow-md" : "bg-slate-800/80 border-slate-700/50 shadow-lg shadow-emerald-500/5"} border rounded-2xl flex items-center justify-center text-emerald-500 backdrop-blur-sm`}>
               <img src={receiptLogo} alt="Nouman Pharmacy" className="w-10 h-10 object-contain" />
             </div>
             <div className="space-y-1 mt-1">
-              <h1 className="text-3xl font-black tracking-tight text-slate-800 uppercase">
+              <h1 className={`text-3xl font-black tracking-tight uppercase ${lightMode ? "text-slate-800" : "text-white"}`}>
                 PharmTrack
               </h1>
               <p
-                className="text-xs text-slate-500 tracking-wider font-bold uppercase cursor-default select-none"
+                className={`text-xs tracking-wider font-bold uppercase cursor-default select-none ${lightMode ? "text-slate-500" : "text-slate-400"}`}
                 onClick={handleDevTap}
               >
                 Administrative Terminal Hub
               </p>
             </div>
           </div>
-          <div className="bg-white border border-slate-200 rounded-3xl p-8 shadow-xl flex flex-col gap-6 relative">
+          <div className={`${lightMode ? "bg-white/80 backdrop-blur-xl border border-white/20 shadow-2xl shadow-emerald-500/5" : "bg-slate-900/60 backdrop-blur-xl border border-slate-700/30 shadow-2xl shadow-emerald-500/5"} rounded-3xl p-8 flex flex-col gap-6 relative animate-scale-in`}>
             <div className="space-y-1">
-              <h2 className="text-base font-black text-slate-800 uppercase tracking-wide">
+              <h2 className={`text-base font-black uppercase tracking-wide ${lightMode ? "text-slate-800" : "text-slate-100"}`}>
                 Terminal Verification
               </h2>
-              <p className="text-xs text-slate-400 font-medium">
+              <p className={`text-xs font-medium ${lightMode ? "text-slate-400" : "text-slate-500"}`}>
                 Please authorize session tokens to log records into warehouse
                 systems.
               </p>
@@ -954,7 +965,7 @@ function App() {
                 </div>
               )}
               <div className="space-y-1">
-                <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                <label className={`text-[10px] font-bold uppercase tracking-wider ${lightMode ? "text-slate-400" : "text-slate-500"}`}>
                   Terminal Operator ID
                 </label>
                 <input
@@ -968,11 +979,15 @@ function App() {
                       username: e.target.value,
                     }))
                   }
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm focus:outline-none focus:border-emerald-500 text-slate-900"
+                  className={`w-full rounded-xl py-3 px-4 text-sm focus:outline-none focus:ring-2 transition-all ${
+                    lightMode
+                      ? "bg-slate-50/80 border border-slate-200 focus:border-emerald-500 focus:ring-emerald-500/20 text-slate-900"
+                      : "bg-slate-800/50 border border-slate-700/50 focus:border-emerald-500 focus:ring-emerald-500/20 text-slate-100 placeholder-slate-500"
+                  }`}
                 />
               </div>
               <div className="space-y-1">
-                <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                <label className={`text-[10px] font-bold uppercase tracking-wider ${lightMode ? "text-slate-400" : "text-slate-500"}`}>
                   Security Access Pin
                 </label>
                 <div className="relative">
@@ -987,12 +1002,16 @@ function App() {
                         password: e.target.value,
                       }))
                     }
-                    className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 px-4 text-sm focus:outline-none focus:border-emerald-500 tracking-widest text-slate-900"
+                    className={`w-full rounded-xl py-3 px-4 text-sm focus:outline-none focus:ring-2 transition-all tracking-widest ${
+                      lightMode
+                        ? "bg-slate-50/80 border border-slate-200 focus:border-emerald-500 focus:ring-emerald-500/20 text-slate-900"
+                        : "bg-slate-800/50 border border-slate-700/50 focus:border-emerald-500 focus:ring-emerald-500/20 text-slate-100"
+                    }`}
                   />
                   <button 
                     type="button"
                     onClick={() => setShowPassword(!showPassword)}
-                    className="absolute right-3 top-3 text-slate-400 hover:text-emerald-500"
+                    className={`absolute right-3 top-3 ${lightMode ? "text-slate-400 hover:text-emerald-500" : "text-slate-500 hover:text-emerald-400"}`}
                   >
                     <span className="material-symbols-outlined text-base">
                       {showPassword ? "visibility_off" : "visibility"}
@@ -1006,7 +1025,7 @@ function App() {
                 className={`w-full font-black py-3.5 px-4 rounded-xl text-xs uppercase tracking-wider shadow-md transition-all flex items-center justify-center gap-2 mt-6 ${
                   attempts >= 3 
                     ? "bg-slate-300 text-slate-500 cursor-not-allowed" 
-                    : "bg-gradient-to-r from-emerald-500 to-teal-500 text-white hover:opacity-95"
+                    : "bg-gradient-to-r from-emerald-500 to-teal-500 text-white hover:opacity-95 hover:shadow-lg hover:shadow-emerald-500/20 active:scale-[0.98]"
                 }`}
               >
                 {attempts >= 3 ? "Locked" : "Initialize Terminal Session"}
@@ -1018,14 +1037,14 @@ function App() {
         {/* ── Developer Password Prompt (7-tap hidden trigger) ── */}
         {devScreen.showPrompt && (
           <div className="fixed inset-0 z-[200] flex items-center justify-center bg-slate-950/90 backdrop-blur-sm">
-            <div className="bg-white border border-slate-200 rounded-2xl p-6 max-w-sm w-full shadow-2xl flex flex-col gap-4 mx-4">
+            <div className={`${lightMode ? "bg-white border-slate-200" : "bg-slate-900 border-slate-700/50"} border rounded-2xl p-6 max-w-sm w-full shadow-2xl flex flex-col gap-4 mx-4 backdrop-blur-sm`}>
               <div className="flex items-center gap-3">
                 <div className="w-10 h-10 rounded-xl bg-violet-500/10 border border-violet-500/20 flex items-center justify-center text-violet-500">
                   <span className="material-symbols-outlined text-lg">terminal</span>
                 </div>
                 <div>
-                  <h3 className="text-sm font-black uppercase tracking-wider text-slate-800">Developer Access</h3>
-                  <p className="text-[11px] text-slate-400 mt-0.5">Enter developer password to continue.</p>
+                  <h3 className={`text-sm font-black uppercase tracking-wider ${lightMode ? "text-slate-800" : "text-slate-200"}`}>Developer Access</h3>
+                  <p className={`text-[11px] mt-0.5 ${lightMode ? "text-slate-400" : "text-slate-500"}`}>Enter developer password to continue.</p>
                 </div>
               </div>
               {devScreen.error && (
@@ -1041,10 +1060,14 @@ function App() {
                   placeholder="Developer password..."
                   value={devScreen.password}
                   onChange={(e) => setDevScreen(s => ({ ...s, password: e.target.value }))}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl py-2.5 px-4 text-sm focus:outline-none focus:border-violet-500 text-slate-900"
+                  className={`w-full rounded-xl py-2.5 px-4 text-sm focus:outline-none focus:ring-2 transition-all ${
+                    lightMode
+                      ? "bg-slate-50 border border-slate-200 focus:border-violet-500 focus:ring-violet-500/20 text-slate-900"
+                      : "bg-slate-800/50 border border-slate-700/50 focus:border-violet-500 focus:ring-violet-500/20 text-slate-100 placeholder-slate-500"
+                  }`}
                 />
                 <div className="flex gap-2">
-                  <button type="button" onClick={() => setDevScreen(s => ({ ...s, showPrompt: false, password: '', error: '' }))} className="flex-1 bg-slate-100 text-slate-600 font-bold py-2.5 rounded-xl text-xs uppercase tracking-wider hover:bg-slate-200">
+                  <button type="button" onClick={() => setDevScreen(s => ({ ...s, showPrompt: false, password: '', error: '' }))} className={`flex-1 font-bold py-2.5 rounded-xl text-xs uppercase tracking-wider transition-all ${lightMode ? "bg-slate-100 text-slate-600 hover:bg-slate-200" : "bg-slate-800 text-slate-400 hover:bg-slate-700 border border-slate-700/50"}`}>
                     Cancel
                   </button>
                   <button type="submit" className="flex-1 bg-violet-600 text-white font-black py-2.5 rounded-xl text-xs uppercase tracking-wider hover:opacity-90">
@@ -1058,9 +1081,9 @@ function App() {
 
         {/* ── Developer Config Screen ── */}
         {devScreen.showConfig && (
-          <div className="fixed inset-0 z-[200] bg-slate-950/90 backdrop-blur-sm overflow-y-auto">
+          <div className="fixed inset-0 z-[200] backdrop-blur-sm overflow-y-auto" style={{ backgroundColor: lightMode ? 'rgba(2,6,23,0.95)' : undefined }}>
             <div className="min-h-full flex items-start justify-center py-8 px-4">
-            <div className="bg-white border border-slate-200 rounded-2xl max-w-lg w-full shadow-2xl flex flex-col gap-0 overflow-hidden">
+            <div className={`${lightMode ? "bg-white border-slate-200" : "bg-slate-900 border-slate-700/50"} border rounded-2xl max-w-lg w-full shadow-2xl flex flex-col gap-0 overflow-hidden`}>
               {/* Header */}
               <div className="bg-violet-600 px-6 py-4 flex items-center justify-between">
                 <div className="flex items-center gap-3">
@@ -1075,30 +1098,30 @@ function App() {
                 </button>
               </div>
 
-              <form onSubmit={handleSaveConfig} className="p-6 flex flex-col gap-5">
+              <form onSubmit={handleSaveConfig} className={`p-6 flex flex-col gap-5 ${lightMode ? "bg-white" : "bg-slate-900"}`}>
 
                 {devScreen.isFirstTime && (
-                  <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-[11px] text-amber-700 font-medium">
+                  <div className={`rounded-xl p-3 text-[11px] font-medium ${lightMode ? "bg-amber-50 border border-amber-200 text-amber-700" : "bg-amber-500/10 border border-amber-500/20 text-amber-400"}`}>
                     First time setup — no developer password is set yet. Set one below before saving.
                   </div>
                 )}
 
                 {/* Mode selector */}
                 <div>
-                  <label className="text-[10px] font-black uppercase tracking-wider text-slate-500 block mb-2">System Role</label>
+                  <label className={`text-[10px] font-black uppercase tracking-wider ${lightMode ? "text-slate-500" : "text-slate-400"} block mb-2`}>System Role</label>
                   <div className="grid grid-cols-2 gap-2">
                     <button type="button" onClick={() => setConfigForm(f => ({ ...f, mode: 'server' }))}
-                      className={`border rounded-xl py-3 text-xs font-black uppercase tracking-wider flex flex-col items-center gap-1.5 transition-all ${configForm.mode === 'server' ? 'border-violet-500 bg-violet-500/5 text-violet-700' : 'border-slate-200 text-slate-400 hover:border-slate-300'}`}>
+                      className={`border rounded-xl py-3 text-xs font-black uppercase tracking-wider flex flex-col items-center gap-1.5 transition-all ${configForm.mode === 'server' ? 'border-violet-500 bg-violet-500/5 text-violet-700' : lightMode ? 'border-slate-200 text-slate-400 hover:border-slate-300' : 'border-slate-700 text-slate-500 hover:border-slate-600'}`}>
                       <span className="material-symbols-outlined text-xl">dns</span>
                       Server / Standalone
                     </button>
                     <button type="button" onClick={() => setConfigForm(f => ({ ...f, mode: 'client' }))}
-                      className={`border rounded-xl py-3 text-xs font-black uppercase tracking-wider flex flex-col items-center gap-1.5 transition-all ${configForm.mode === 'client' ? 'border-violet-500 bg-violet-500/5 text-violet-700' : 'border-slate-200 text-slate-400 hover:border-slate-300'}`}>
+                      className={`border rounded-xl py-3 text-xs font-black uppercase tracking-wider flex flex-col items-center gap-1.5 transition-all ${configForm.mode === 'client' ? 'border-violet-500 bg-violet-500/5 text-violet-700' : lightMode ? 'border-slate-200 text-slate-400 hover:border-slate-300' : 'border-slate-700 text-slate-500 hover:border-slate-600'}`}>
                       <span className="material-symbols-outlined text-xl">computer</span>
                       Client Terminal
                     </button>
                   </div>
-                  <p className="text-[10px] text-slate-400 mt-1.5">
+                  <p className={`text-[10px] ${lightMode ? "text-slate-400" : "text-slate-500"} mt-1.5`}>
                     {configForm.mode === 'server' ? 'This PC holds the database and serves all clients on the network.' : 'This PC connects to the server PC over the local network.'}
                   </p>
                 </div>
@@ -1107,22 +1130,22 @@ function App() {
                 {configForm.mode === 'client' && (
                   <div className="flex flex-col gap-3">
                     <div>
-                      <label className="text-[10px] font-black uppercase tracking-wider text-slate-500 block mb-1">Server IP Address</label>
+                      <label className={`text-[10px] font-black uppercase tracking-wider ${lightMode ? "text-slate-500" : "text-slate-400"} block mb-1`}>Server IP Address</label>
                       <input type="text" placeholder="192.168.1.100" required value={configForm.serverIp}
                         onChange={(e) => setConfigForm(f => ({ ...f, serverIp: e.target.value }))}
-                        className="w-full bg-slate-50 border border-slate-200 rounded-xl py-2.5 px-3 text-sm font-mono focus:outline-none focus:border-violet-500 text-slate-900" />
-                      <p className="text-[10px] text-slate-400 mt-1">The static IP of the server PC on the pharmacy network.</p>
+                        className={`w-full rounded-xl py-2.5 px-3 text-sm font-mono focus:outline-none focus:ring-2 transition-all ${lightMode ? "bg-slate-50 border border-slate-200 focus:border-violet-500 focus:ring-violet-500/20 text-slate-900" : "bg-slate-800/50 border border-slate-700/50 focus:border-violet-500 focus:ring-violet-500/20 text-slate-100 placeholder-slate-500"}`} />
+                      <p className={`text-[10px] ${lightMode ? "text-slate-400" : "text-slate-500"} mt-1`}>The static IP of the server PC on the pharmacy network.</p>
                     </div>
                     <div>
-                      <label className="text-[10px] font-black uppercase tracking-wider text-slate-500 block mb-1">Port</label>
+                      <label className={`text-[10px] font-black uppercase tracking-wider ${lightMode ? "text-slate-500" : "text-slate-400"} block mb-1`}>Port</label>
                       <input type="text" value={configForm.serverPort}
                         onChange={(e) => setConfigForm(f => ({ ...f, serverPort: e.target.value }))}
-                        className="w-full bg-slate-50 border border-slate-200 rounded-xl py-2.5 px-3 text-sm font-mono focus:outline-none focus:border-violet-500 text-slate-900" />
+                        className={`w-full rounded-xl py-2.5 px-3 text-sm font-mono focus:outline-none focus:ring-2 transition-all ${lightMode ? "bg-slate-50 border border-slate-200 focus:border-violet-500 focus:ring-violet-500/20 text-slate-900" : "bg-slate-800/50 border border-slate-700/50 focus:border-violet-500 focus:ring-violet-500/20 text-slate-100"}`} />
                     </div>
                     {/* Test connection */}
                     <div className="flex items-center gap-2">
                       <button type="button" onClick={handleTestConnection}
-                        className="bg-slate-100 text-slate-700 font-bold py-2 px-4 rounded-xl text-xs uppercase tracking-wider hover:bg-slate-200 flex items-center gap-1.5">
+                        className={`font-bold py-2 px-4 rounded-xl text-xs uppercase tracking-wider flex items-center gap-1.5 transition-all ${lightMode ? "bg-slate-100 text-slate-700 hover:bg-slate-200" : "bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700/50"}`}>
                         <span className="material-symbols-outlined text-sm">network_check</span>
                         Test Connection
                       </button>
@@ -1137,29 +1160,29 @@ function App() {
 
                 {/* API security token — must match on server + every client */}
                 <div>
-                  <label className="text-[10px] font-black uppercase tracking-wider text-slate-500 block mb-1">Network Security Token</label>
+                  <label className={`text-[10px] font-black uppercase tracking-wider ${lightMode ? "text-slate-500" : "text-slate-400"} block mb-1`}>Network Security Token</label>
                   <div className="flex gap-2">
                     <input type="text" placeholder="Not set — API is open to the network!"
                       value={configForm.apiToken}
                       onChange={(e) => setConfigForm(f => ({ ...f, apiToken: e.target.value }))}
-                      className="flex-1 min-w-0 bg-slate-50 border border-slate-200 rounded-xl py-2.5 px-3 text-[11px] font-mono focus:outline-none focus:border-violet-500 text-slate-900" />
+                      className={`flex-1 min-w-0 rounded-xl py-2.5 px-3 text-[11px] font-mono focus:outline-none focus:ring-2 transition-all ${lightMode ? "bg-slate-50 border border-slate-200 focus:border-violet-500 focus:ring-violet-500/20 text-slate-900" : "bg-slate-800/50 border border-slate-700/50 focus:border-violet-500 focus:ring-violet-500/20 text-slate-100 placeholder-slate-500"}`} />
                     <button type="button"
                       onClick={async () => {
                         const t = await window.electronAPI.generateApiToken();
                         setConfigForm(f => ({ ...f, apiToken: t }));
                       }}
-                      className="bg-slate-100 text-slate-700 font-bold py-2 px-3 rounded-xl text-[10px] uppercase tracking-wider hover:bg-slate-200 shrink-0">
+                      className={`font-bold py-2 px-3 rounded-xl text-[10px] uppercase tracking-wider transition-all shrink-0 ${lightMode ? "bg-slate-100 text-slate-700 hover:bg-slate-200" : "bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700/50"}`}>
                       Generate
                     </button>
                     <button type="button"
                       onClick={() => navigator.clipboard?.writeText(configForm.apiToken || '')}
                       disabled={!configForm.apiToken}
-                      className="bg-slate-100 text-slate-700 font-bold py-2 px-3 rounded-xl text-[10px] uppercase tracking-wider hover:bg-slate-200 shrink-0 disabled:opacity-40">
+                      className={`font-bold py-2 px-3 rounded-xl text-[10px] uppercase tracking-wider transition-all shrink-0 disabled:opacity-40 ${lightMode ? "bg-slate-100 text-slate-700 hover:bg-slate-200" : "bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700/50"}`}>
                       Copy
                     </button>
                   </div>
                   {configForm.apiToken ? (
-                    <p className="text-[10px] text-slate-400 mt-1">Paste this exact token into every client machine's developer screen, or they won't be able to connect.</p>
+                    <p className={`text-[10px] ${lightMode ? "text-slate-400" : "text-slate-500"} mt-1`}>Paste this exact token into every client machine's developer screen, or they won't be able to connect.</p>
                   ) : (
                     <p className="text-[10px] text-rose-500 mt-1 font-medium">⚠ Without a token, any device on the pharmacy WiFi can read your data and post fake sales. Generate one on the server, then copy it to each client.</p>
                   )}
@@ -1167,27 +1190,27 @@ function App() {
 
                 {/* Developer password */}
                 <div>
-                  <label className="text-[10px] font-black uppercase tracking-wider text-slate-500 block mb-1">
+                  <label className={`text-[10px] font-black uppercase tracking-wider ${lightMode ? "text-slate-500" : "text-slate-400"} block mb-1`}>
                     {devScreen.isFirstTime ? 'Set Developer Password' : 'Change Developer Password'} (min 4 characters)
                   </label>
                   <input type="password" placeholder={devScreen.isFirstTime ? 'Set a developer password...' : 'Leave blank to keep current'}
                     value={configForm.newDevPassword}
                     onChange={(e) => setConfigForm(f => ({ ...f, newDevPassword: e.target.value }))}
-                    className="w-full bg-slate-50 border border-slate-200 rounded-xl py-2.5 px-3 text-sm focus:outline-none focus:border-violet-500 text-slate-900" />
-                  <p className="text-[10px] text-slate-400 mt-1">This password protects these developer settings. Only you should know it.</p>
+                    className={`w-full rounded-xl py-2.5 px-3 text-sm focus:outline-none focus:ring-2 transition-all ${lightMode ? "bg-slate-50 border border-slate-200 focus:border-violet-500 focus:ring-violet-500/20 text-slate-900" : "bg-slate-800/50 border border-slate-700/50 focus:border-violet-500 focus:ring-violet-500/20 text-slate-100 placeholder-slate-500"}`} />
+                  <p className={`text-[10px] ${lightMode ? "text-slate-400" : "text-slate-500"} mt-1`}>This password protects these developer settings. Only you should know it.</p>
                 </div>
 
                 {/* Database tools */}
-                <div className="border-t pt-4 border-slate-100">
-                  <label className="text-[10px] font-black uppercase tracking-wider text-slate-500 block mb-2">Database Tools</label>
+                <div className={`border-t pt-4 ${lightMode ? "border-slate-100" : "border-slate-800"}`}>
+                  <label className={`text-[10px] font-black uppercase tracking-wider ${lightMode ? "text-slate-500" : "text-slate-400"} block mb-2`}>Database Tools</label>
                   <div className="grid grid-cols-2 gap-2">
                     <button type="button" onClick={handleDevExportDb}
-                      className="border border-slate-200 text-slate-600 font-bold py-2.5 rounded-xl text-[10px] uppercase tracking-wider hover:bg-slate-50 flex items-center justify-center gap-1.5">
+                      className={`border font-bold py-2.5 rounded-xl text-[10px] uppercase tracking-wider flex items-center justify-center gap-1.5 transition-all ${lightMode ? "border-slate-200 text-slate-600 hover:bg-slate-50" : "border-slate-700 text-slate-400 hover:bg-slate-800"}`}>
                       <span className="material-symbols-outlined text-sm">download</span>
                       Export Backup
                     </button>
                     <button type="button" onClick={handleDevImportDb}
-                      className="border border-rose-200 text-rose-600 font-bold py-2.5 rounded-xl text-[10px] uppercase tracking-wider hover:bg-rose-50 flex items-center justify-center gap-1.5">
+                      className={`border font-bold py-2.5 rounded-xl text-[10px] uppercase tracking-wider flex items-center justify-center gap-1.5 transition-all ${lightMode ? "border-rose-200 text-rose-600 hover:bg-rose-50" : "border-rose-500/30 text-rose-400 hover:bg-rose-950/30"}`}>
                       <span className="material-symbols-outlined text-sm">upload</span>
                       Import / Restore
                     </button>
@@ -1196,14 +1219,14 @@ function App() {
                 </div>
 
                 {/* Printer tools */}
-                <div className="border-t pt-4 border-slate-100">
-                  <label className="text-[10px] font-black uppercase tracking-wider text-slate-500 block mb-2">Printer Test</label>
+                <div className={`border-t pt-4 ${lightMode ? "border-slate-100" : "border-slate-800"}`}>
+                  <label className={`text-[10px] font-black uppercase tracking-wider ${lightMode ? "text-slate-500" : "text-slate-400"} block mb-2`}>Printer Test</label>
                   <button type="button" onClick={handleDevReprintLast} disabled={isReprintingLast}
-                    className="w-full border border-slate-200 text-slate-600 font-bold py-2.5 rounded-xl text-[10px] uppercase tracking-wider hover:bg-slate-50 disabled:opacity-50 flex items-center justify-center gap-1.5">
+                    className={`w-full border font-bold py-2.5 rounded-xl text-[10px] uppercase tracking-wider disabled:opacity-50 flex items-center justify-center gap-1.5 transition-all ${lightMode ? "border-slate-200 text-slate-600 hover:bg-slate-50" : "border-slate-700 text-slate-400 hover:bg-slate-800"}`}>
                     <span className="material-symbols-outlined text-sm">print</span>
                     {isReprintingLast ? 'Sending...' : 'Reprint Last Receipt'}
                   </button>
-                  <p className="text-[10px] text-slate-400 mt-1.5">Reprints the most recent sale on the server's thermal printer — use this to test the printer without making a sale.</p>
+                  <p className={`text-[10px] ${lightMode ? "text-slate-400" : "text-slate-500"} mt-1.5`}>Reprints the most recent sale on the server's thermal printer — use this to test the printer without making a sale.</p>
                 </div>
 
                 {/* Save */}

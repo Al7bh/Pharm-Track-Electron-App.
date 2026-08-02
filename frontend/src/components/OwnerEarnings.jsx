@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 
-function OwnerEarnings({ inventory, salesHistory, lightMode }) {
+function OwnerEarnings({ inventory, salesHistory, lightMode, onDeleteReturnTranscript }) {
   const [vaultView, setVaultView] = useState("overview"); 
   const [timeFilter, setTimeFilter] = useState("all"); 
   const [graphView, setGraphView] = useState("monthly"); 
@@ -8,6 +8,8 @@ function OwnerEarnings({ inventory, salesHistory, lightMode }) {
   const [passwords, setPasswords] = useState({ oldPin: "", newPin: "", confirmPin: "" });
   const [passMessage, setPassMessage] = useState({ text: "", type: "" });
   const [selectedReturnInvoice, setSelectedReturnInvoice] = useState(null);
+  const [returnDeleteConfirm, setReturnDeleteConfirm] = useState(false);
+  const [isDeletingReturn, setIsDeletingReturn] = useState(false);
 
   const [newUsername, setNewUsername] = useState("");
   const [userMessage, setUserMessage] = useState({ text: "", type: "" });
@@ -446,7 +448,7 @@ function OwnerEarnings({ inventory, salesHistory, lightMode }) {
                         return (
                           <tr 
                             key={sale.id} 
-                            onClick={() => setSelectedReturnInvoice(sale)}
+                            onClick={() => { setSelectedReturnInvoice(sale); setReturnDeleteConfirm(false); }}
                             className={`transition-colors duration-150 cursor-pointer ${
                               isSelected
                                 ? lightMode ? "bg-rose-500/10 hover:bg-rose-500/15" : "bg-rose-500/20 hover:bg-rose-500/30"
@@ -476,7 +478,16 @@ function OwnerEarnings({ inventory, salesHistory, lightMode }) {
                   <span>Return Inspection</span>
                 </h2>
                 {selectedReturnInvoice && (
-                  <button onClick={() => setSelectedReturnInvoice(null)} className="text-slate-400 hover:text-slate-600 flex items-center text-xs font-bold transition-colors">Close</button>
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={() => setReturnDeleteConfirm(true)}
+                      className="text-rose-500 hover:text-rose-600 flex items-center gap-1 text-xs font-bold transition-colors"
+                    >
+                      <span className="material-symbols-outlined text-sm">delete</span>
+                      Delete
+                    </button>
+                    <button onClick={() => { setSelectedReturnInvoice(null); setReturnDeleteConfirm(false); }} className="text-slate-400 hover:text-slate-600 flex items-center text-xs font-bold transition-colors">Close</button>
+                  </div>
                 )}
               </div>
 
@@ -533,10 +544,43 @@ function OwnerEarnings({ inventory, salesHistory, lightMode }) {
 
               {selectedReturnInvoice && (
                 <div className={`border-t p-5 flex flex-col gap-3 shrink-0 ${lightMode ? "bg-slate-50 border-slate-200" : "bg-slate-950 border-slate-800"}`}>
-                  <div className="flex justify-between items-center text-sm text-rose-500">
-                    <span><b>TOTAL REFUND ISSUED:</b></span>
-                    <span className="font-mono text-base font-black">Rs. {Math.abs(selectedReturnInvoice.grandTotal)}</span>
-                  </div>
+                  {returnDeleteConfirm ? (
+                    <div className="space-y-3">
+                      <p className="text-xs font-bold text-rose-500 text-center leading-relaxed">
+                        This will permanently delete this return record. This does not undo the refund or restock — it only removes the transcript. This can't be undone.
+                      </p>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => setReturnDeleteConfirm(false)}
+                          disabled={isDeletingReturn}
+                          className={`flex-1 py-2.5 rounded-xl text-xs font-black uppercase tracking-wider border ${lightMode ? "border-slate-200 text-slate-600 hover:bg-slate-100" : "border-slate-800 text-slate-300 hover:bg-slate-800"}`}
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={() => {
+                            if (!onDeleteReturnTranscript) return;
+                            setIsDeletingReturn(true);
+                            onDeleteReturnTranscript(selectedReturnInvoice.id)
+                              .then(() => {
+                                setSelectedReturnInvoice(null);
+                                setReturnDeleteConfirm(false);
+                              })
+                              .finally(() => setIsDeletingReturn(false));
+                          }}
+                          disabled={isDeletingReturn}
+                          className="flex-1 py-2.5 rounded-xl text-xs font-black uppercase tracking-wider bg-rose-500 text-white hover:bg-rose-600 disabled:opacity-60"
+                        >
+                          {isDeletingReturn ? "Deleting…" : "Confirm Delete"}
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex justify-between items-center text-sm text-rose-500">
+                      <span><b>TOTAL REFUND ISSUED:</b></span>
+                      <span className="font-mono text-base font-black">Rs. {Math.abs(selectedReturnInvoice.grandTotal)}</span>
+                    </div>
+                  )}
                 </div>
               )}
             </section>

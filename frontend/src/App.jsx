@@ -7,6 +7,17 @@ import receiptLogo from "./assets/receipt-logo.png";
 // =========================================================================
 // ENTERPRISE GS1 BARCODE PARSER ENGINE
 // =========================================================================
+// GS1-128 barcodes terminate variable-length fields (batch/lot = AI 10,
+// serial = AI 21, count = AI 30, additional product data = AI 240) with an
+// FNC1 control character, transmitted by most scanners as ASCII 0x1D
+// (Group Separator). That character is the ONLY unambiguous way to know
+// where a variable-length field ends — digit-pattern guessing is a
+// fallback for scanners/barcodes that don't send it, and can misfire if
+// the field's own content happens to contain a sequence that looks like
+// the start of another Application Identifier (this is what was truncating
+// batch codes and letting price text leak into the name field).
+const GS = "\x1D";
+
 const parsePharmacyBarcode = (scan) => {
   let parsed = {
     raw: scan,
@@ -21,8 +32,21 @@ const parsePharmacyBarcode = (scan) => {
 
   parsed.gtin = scan.slice(2, 16);
   let remaining = scan.slice(16);
+  // Fixed-length AIs (e.g. GTIN, expiry) are sometimes still followed by a
+  // defensive separator from the encoder even though the spec doesn't
+  // require one — strip a leading one if present so it doesn't get
+  // mistaken for the start of the next field's content.
+  if (remaining.startsWith(GS)) remaining = remaining.slice(1);
 
-  const findNextBoundary = (str) => {
+  // Finds where the CURRENT variable-length field ends within `str`.
+  const findFieldEnd = (str) => {
+    // Preferred: the true GS1 separator, if the scanner transmitted it.
+    // Authoritative — can't be fooled by digits inside the field.
+    const gsIdx = str.indexOf(GS);
+    if (gsIdx !== -1) return { end: gsIdx, matchedSeparator: true };
+
+    // Fallback: best-effort guess based on the next recognizable AI
+    // pattern. Only used when no real separator is present.
     let boundaryIdx = str.length;
     const match17 = str.match(/17\d{6}/);
     if (match17 && match17.index < boundaryIdx) boundaryIdx = match17.index;
@@ -36,31 +60,35 @@ const parsePharmacyBarcode = (scan) => {
     const match30 = str.match(/30\d{1,8}/);
     if (match30 && match30.index < boundaryIdx) boundaryIdx = match30.index;
 
-    return boundaryIdx;
+    return { end: boundaryIdx, matchedSeparator: false };
   };
+
+  // Consumes a leading separator, if any, after a field has been sliced off.
+  const consumeSeparator = (str) => (str.startsWith(GS) ? str.slice(1) : str);
 
   while (remaining.length > 0) {
     if (remaining.startsWith("17") && remaining.length >= 8) {
       const rawExp = remaining.slice(2, 8);
       if (/^\d{6}$/.test(rawExp)) {
         parsed.expiry = `20${rawExp.slice(0, 2)}-${rawExp.slice(2, 4)}-${rawExp.slice(4, 6)}`;
-        remaining = remaining.slice(8);
+        remaining = consumeSeparator(remaining.slice(8));
         continue;
       }
     }
 
     if (remaining.startsWith("10")) {
       remaining = remaining.slice(2);
-      const nextTagIdx = findNextBoundary(remaining);
-      parsed.batch = remaining.slice(0, nextTagIdx);
-      remaining = remaining.slice(nextTagIdx);
+      const { end } = findFieldEnd(remaining);
+      parsed.batch = remaining.slice(0, end);
+      remaining = consumeSeparator(remaining.slice(end));
     } else if (remaining.startsWith("21") || remaining.startsWith("30")) {
       remaining = remaining.slice(2);
-      const nextTagIdx = findNextBoundary(remaining);
-      remaining = remaining.slice(nextTagIdx);
+      const { end } = findFieldEnd(remaining);
+      remaining = consumeSeparator(remaining.slice(end));
     } else if (remaining.startsWith("240")) {
       remaining = remaining.slice(3);
-      const extraText = remaining;
+      const { end } = findFieldEnd(remaining);
+      const extraText = remaining.slice(0, end);
       const rsMatch = extraText.match(/(.*?)Rs\.?(\d+(\.\d+)?)/i);
       if (rsMatch) {
         parsed.name = rsMatch[1].trim();
@@ -68,7 +96,7 @@ const parsePharmacyBarcode = (scan) => {
       } else {
         parsed.name = extraText.trim();
       }
-      remaining = "";
+      remaining = consumeSeparator(remaining.slice(end));
     } else {
       break;
     }
@@ -156,6 +184,10 @@ function App() {
 
   const [pendingCollisions, setPendingCollisions] = useState([]);
   const [isProcessingSale, setIsProcessingSale] = useState(false);
+  // No-Print toggle at top-right of the Sales tab. Default OFF — receipts
+  // print as normal unless explicitly switched on. Session-only by design
+  // (resets to OFF on reload), so it can never be silently left on.
+  const [noPrintMode, setNoPrintMode] = useState(false);
 
   // ==========================================
   // CLICK-OUTSIDE DETECTOR FOR SEARCH
@@ -284,7 +316,7 @@ function App() {
         showNotification('Reprint Failed', (res && res.message) || 'Could not reprint the last receipt.', 'error');
       }
     } catch (err) {
-      showNotification('Reprint Failed', err.message || 'Printer or server unreachable.', 'error');
+      showNotification('Reprint Failed', friendlyErrorMessage(err, 'Could not print the receipt. Please check the printer and try again.'), 'error');
     } finally {
       setIsReprintingLast(false);
     }
@@ -359,8 +391,14 @@ function App() {
             e.target.blur();
           }
 
+          // Preserve \x1D (GS) — it's the real GS1 field separator the
+          // barcode parser relies on to split variable-length fields
+          // (batch, price, etc.) reliably. Stripping it here was forcing
+          // the parser into unreliable digit-pattern guessing, which is
+          // what caused truncated batch codes and price text leaking into
+          // the name field.
           let currentScanData = scanBuffer
-            .replace(/[\x00-\x1F\x7F]/g, "")
+            .replace(/[\x00-\x1C\x1E\x1F\x7F]/g, "")
             .trim();
           scanBuffer = "";
 
@@ -400,8 +438,8 @@ function App() {
                   handleSearchChange({ target: { value: parsedData.gtin } });
                 }
                 showNotification(
-                  "Product Not Found",
-                  "This barcode is not registered.",
+                  "Item Not Found",
+                  "This barcode is not in our system. Please register the item first.",
                   "warning",
                 );
               }
@@ -456,6 +494,30 @@ function App() {
   const closeNotification = () =>
     setNotification((prev) => ({ ...prev, isOpen: false }));
 
+  // Translates raw technical error text (SQL errors, network stack traces,
+  // "Failed to fetch", etc.) into something a non-technical cashier won't
+  // find alarming. Falls back to the caller-supplied plain-language message
+  // for anything not recognized, instead of ever surfacing raw err.message.
+  const friendlyErrorMessage = (err, fallback) => {
+    const raw = (err && err.message ? err.message : "").toString();
+    if (!raw) return fallback;
+    const patterns = [
+      [/sqlite_constraint.*unique/i, "This item already exists — please check the barcode and batch number."],
+      [/sqlite_constraint/i, "This couldn't be saved because it conflicts with an existing record."],
+      [/sqlite|database is locked|no such table|no such column/i, "There was a problem saving to the database. Please try again."],
+      [/econnrefused|failed to fetch|networkerror|network error|fetch failed/i, "Couldn't reach the main computer. Please check the network connection."],
+      [/etimedout|timeout/i, "The request took too long. Please check the connection and try again."],
+      [/unexpected token|json/i, "Received an unexpected response. Please try again."],
+      [/enoent|no such file/i, "A required file couldn't be found."],
+    ];
+    for (const [pattern, friendly] of patterns) {
+      if (pattern.test(raw)) return friendly;
+    }
+    // Unrecognized error: prefer the caller's plain-language fallback over
+    // showing the raw technical text to the user.
+    return fallback || "Something went wrong. Please try again.";
+  };
+
   // Sequence guards: the 5s poll fires regardless of whether the previous
   // request is still in flight. Over the network a slow response could land
   // AFTER a newer one and drag the UI backwards — including undoing the
@@ -481,7 +543,7 @@ function App() {
         if (seq !== inventorySeqRef.current) return;
         console.error("Inventory refresh failed:", err);
         setServerStatus("offline");
-        if (!silent) showNotification("Database Error", err.message || "Failed to load inventory ledger.", "error");
+if (!silent) showNotification("Connection Issue", friendlyErrorMessage(err, "Could not load the stock list. Please check the main computer."), "error");
       });
   };
 
@@ -498,31 +560,87 @@ function App() {
         if (seq !== salesSeqRef.current) return;
         console.error("Sales history refresh failed:", err);
         setServerStatus("offline");
-        if (!silent) showNotification("Database Error", err.message || "Failed to load sales history.", "error");
+if (!silent) showNotification("Connection Issue", friendlyErrorMessage(err, "Could not load the sales history. Please check the main computer."), "error");
+      });
+  };
+
+  // Deletes a return transcript outright (no inventory reversal — see
+  // performDeleteReturnTranscript in main.js for the guard against
+  // deleting anything that isn't a return record).
+  const handleDeleteReturnTranscript = (returnId) => {
+    if (!window.electronAPI || !window.electronAPI.deleteReturnTranscript) return Promise.reject(new Error("Not available"));
+    return window.electronAPI.deleteReturnTranscript(returnId)
+      .then(() => {
+        refreshSalesHistory();
+        showNotification("Return Deleted", "The return transcript has been removed.", "success");
+      })
+      .catch((err) => {
+        console.error("Delete return transcript failed:", err);
+        showNotification("Couldn't Delete Return", "This return record couldn't be removed. Please try again, and check your connection to the main computer if this keeps happening.", "error");
+        throw err;
       });
   };
 
   const handleMagicScanSale = (dbProduct) => {
     setCart((prevCart) => {
-      let currentUnitsInCart = 0;
-      prevCart.forEach((item) => {
-        if (item.productId === dbProduct.id.toString()) {
-          currentUnitsInCart += item.rawUnits * item.qty;
-        }
-      });
+      const packFactor = dbProduct.factor || 2;
+      const tabletsPerStripForScan = parseInt(dbProduct.tabletsPerStrip) || 0;
+      // remainingUnits is expressed in strip-equivalent units either way —
+      // for tablet-enabled products it's derived from real available
+      // tablets (accounting for the open-strip accumulator), so it can come
+      // out fractional (e.g. 0.3 = 3 loose tablets left), which is handled
+      // explicitly below rather than silently letting it round into a sale.
+      let remainingUnits;
 
-      const remainingUnits = dbProduct.totalUnits - currentUnitsInCart;
+      if (tabletsPerStripForScan > 0) {
+        const openStripTablets = parseInt(dbProduct.openStripTablets) || 0;
+        let tabletsInCart = 0;
+        prevCart.forEach((item) => {
+          if (item.productId === dbProduct.id.toString()) {
+            tabletsInCart += item.type === "Tablet"
+              ? item.qty
+              : item.rawUnits * item.qty * tabletsPerStripForScan;
+          }
+        });
+        const availableTablets = Math.max(
+          0,
+          (dbProduct.totalUnits * tabletsPerStripForScan) - openStripTablets - tabletsInCart
+        );
+        remainingUnits = availableTablets / tabletsPerStripForScan;
+      } else {
+        let currentUnitsInCart = 0;
+        prevCart.forEach((item) => {
+          if (item.productId === dbProduct.id.toString()) {
+            currentUnitsInCart += item.rawUnits * item.qty;
+          }
+        });
+        remainingUnits = dbProduct.totalUnits - currentUnitsInCart;
+      }
 
       if (remainingUnits <= 0) {
         showNotification(
-          "Stock Depleted",
-          `Cannot add more ${dbProduct.name}. Inventory limit reached!`,
+          "Not Enough Stock",
+          `Cannot add more "${dbProduct.name}". We only have what's shown on the shelf.`,
           "error",
         );
         return prevCart;
       }
 
-      const packFactor = dbProduct.factor || 2;
+      // This quick-scan flow only ever adds a whole Box or Strip — it has
+      // no quantity prompt, so it can't fulfill a loose-tablet sale. If less
+      // than a full strip's worth remains (e.g. 3 tablets left in an open
+      // strip), refuse here instead of rounding up into an oversold "full"
+      // strip — the cashier should use "Add Tablet(s)" on the product card
+      // for that instead.
+      if (tabletsPerStripForScan > 0 && remainingUnits < 1) {
+        showNotification(
+          "Loose Tablets Only",
+          `Only a few loose tablets of "${dbProduct.name}" remain. Use "Add Tablet(s)" on its card instead.`,
+          "warning",
+        );
+        return prevCart;
+      }
+
       let sellType = "Box";
       let unitsNeeded = packFactor;
       let unitPrice = dbProduct.retailPrice;
@@ -589,7 +707,12 @@ function App() {
       expiry: dbProduct.expiry || "N/A",
       totalUnitsAvailable: parseInt(dbProduct.totalUnits) || 0,
       retailPricePerBox: parseFloat(dbProduct.retailPrice) || 0,
-      buyingPrice: parseFloat(dbProduct.buyingPrice) || 0, 
+      buyingPrice: parseFloat(dbProduct.buyingPrice) || 0,
+      // Was missing — SalesCounter's "Add Tablet(s)" button checks these,
+      // so without them here it could never appear even when a product had
+      // Tablets/Strip configured.
+      tabletsPerStrip: parseInt(dbProduct.tabletsPerStrip) || 0,
+      openStripTablets: parseInt(dbProduct.openStripTablets) || 0,
     };
 
     setActiveProducts((prev) => [standardProduct, ...prev]);
@@ -632,19 +755,19 @@ function App() {
       // Some handlers resolve {success:false, message} with HTTP 200 rather
       // than rejecting — don't report those as a success.
       if (res && res.success === false) {
-        showNotification("Stock Update Failed", res.message || "Database rejected the stock update.", "error");
+        showNotification("Could Not Save", res.message || "The system could not save this item. Please try again.", "error");
         return false;
       }
 
       showNotification(
-        "Success",
-        isEditMode ? "Product profile updated successfully!" : "New stock recorded into database!",
+        "Saved Successfully",
+        isEditMode ? "Item details have been updated!" : "New stock has been added to the system!",
         "success"
       );
       refreshStockLedger();
       return true;
     } catch (err) {
-      showNotification("Stock Update Failed", err.message || "Database rejected the stock update.", "error");
+      showNotification("Stock Update Failed", friendlyErrorMessage(err, "This stock update couldn't be saved. Please try again."), "error");
       return false;
     }
   };
@@ -655,11 +778,11 @@ function App() {
     if (!window.electronAPI || !window.electronAPI.restockInventory) return false;
     try {
       await window.electronAPI.restockInventory({ id: itemId, unitsToAdd });
-      showNotification("Stock Added", "Units credited to the existing batch.", "success");
+      showNotification("Stock Updated", "New stock has been added successfully.", "success");
       refreshStockLedger();
       return true;
     } catch (err) {
-      showNotification("Restock Failed", err.message || "Database rejected the restock.", "error");
+      showNotification("Restock Failed", friendlyErrorMessage(err, "Could not add stock. Please check the main computer and try again."), "error");
       return false;
     }
   };
@@ -668,25 +791,111 @@ function App() {
     if (window.electronAPI && window.electronAPI.deleteInventory) {
       try {
         await window.electronAPI.deleteInventory(itemId);
-        showNotification(
+showNotification(
           "Deleted",
-          "Stock item removed successfully from ledger.",
+          "Item has been removed from stock.",
           "success",
         );
         refreshStockLedger();
       } catch (err) {
         showNotification(
-          "Error",
-          "Could not complete deletion action.",
+          "Could Not Delete",
+          "The item could not be removed. Please try again.",
           "error",
         );
       }
     }
   };
 
-  const handleAddItemToCart = (targetProduct, sellType) => {
+  const handleAddItemToCart = (targetProduct, sellType, tabletQty) => {
     const packFactor = targetProduct.factor || 10;
+
+    // Tablet sales are a distinct unit system (individual tablets, not
+    // strips/boxes) and are only ever available for products with a
+    // tabletsPerStrip value set (Feature 2/3). Kept as its own branch since
+    // its availability check works against the open-strip tablet
+    // accumulator rather than plain totalUnits.
+    if (sellType === "Tablet") {
+      const tabletsPerStrip = parseInt(targetProduct.tabletsPerStrip) || 0;
+      const qtyToAdd = parseInt(tabletQty) || 0;
+      if (tabletsPerStrip <= 0 || qtyToAdd <= 0) return;
+
+      const boxPrice = parseFloat(targetProduct.retailPricePerBox) || parseFloat(targetProduct.retailPrice) || 0;
+      const boxCost = parseFloat(targetProduct.buyingPricePerBox || targetProduct.buyingPrice) || 0;
+      const unitPrice = (boxPrice / packFactor) / tabletsPerStrip;
+      const unitCost = (boxCost / packFactor) / tabletsPerStrip;
+
+      let stockLimitReached = false;
+      let availableForMessage = 0;
+
+      setCart((prevCart) => {
+        let tabletsInCart = 0;
+        prevCart.forEach((item) => {
+          if (item.productId === targetProduct.id?.toString() && item.type === "Tablet") {
+            tabletsInCart += item.qty;
+          }
+        });
+
+        const trueTotalUnits = targetProduct.totalUnits !== undefined ? targetProduct.totalUnits : targetProduct.totalUnitsAvailable;
+        const openStripTablets = parseInt(targetProduct.openStripTablets) || 0;
+        const availableTablets = (trueTotalUnits * tabletsPerStrip) - openStripTablets;
+        availableForMessage = Math.max(0, availableTablets - tabletsInCart);
+
+        if (tabletsInCart + qtyToAdd > availableTablets) {
+          stockLimitReached = true;
+          return prevCart;
+        }
+
+        const existingItemIndex = prevCart.findIndex(
+          (item) => item.productId === targetProduct.id?.toString() && item.type === "Tablet",
+        );
+
+        if (existingItemIndex >= 0) {
+          return prevCart.map((item, index) =>
+            index === existingItemIndex ? { ...item, qty: item.qty + qtyToAdd } : item,
+          );
+        } else {
+          return [
+            ...prevCart,
+            {
+              id: `${targetProduct.id}-Tablet-${Date.now()}`,
+              productId: targetProduct.id?.toString(),
+              name: targetProduct.name,
+              batch: targetProduct.batch,
+              price: unitPrice,
+              unitCost: unitCost,
+              // qty IS the tablet count for this line — consistent with the
+              // existing price*qty line-total pattern, and what the backend
+              // deducts against the open-strip accumulator at checkout.
+              qty: qtyToAdd,
+              type: "Tablet",
+              // Expressed as a strip-fraction so it composes correctly with
+              // the existing box/strip "units reserved in cart" displays
+              // elsewhere (SalesCounter's Warehouse Sub-Units Balance, etc.)
+              // without needing to special-case Tablet lines there too.
+              rawUnits: 1 / tabletsPerStrip,
+              itemDiscountPercent: 0,
+            },
+          ];
+        }
+      });
+
+      if (stockLimitReached) {
+        showNotification(
+          "Not Enough Stock",
+          `Only ${availableForMessage} tablet(s) left in stock.`,
+          "warning",
+        );
+        return;
+      }
+
+      if (currentTab === "sales") setIsCartOpen(true);
+      return;
+    }
+
     const unitsNeeded = sellType === "Box" ? packFactor : 1;
+    const tabletsPerStripForCheck = parseInt(targetProduct.tabletsPerStrip) || 0;
+    const isTabletAccurateProduct = tabletsPerStripForCheck > 0;
 
     const boxPrice =
       parseFloat(targetProduct.retailPricePerBox) ||
@@ -701,21 +910,46 @@ function App() {
     let stockLimitReached = false;
 
     setCart((prevCart) => {
-      let currentUnitsInCart = 0;
-      prevCart.forEach((item) => {
-        if (item.productId === targetProduct.id?.toString()) {
-          currentUnitsInCart += item.rawUnits * item.qty;
-        }
-      });
-
       const trueTotalUnits =
         targetProduct.totalUnits !== undefined
           ? targetProduct.totalUnits
           : targetProduct.totalUnitsAvailable;
 
-      if (currentUnitsInCart + unitsNeeded > trueTotalUnits) {
-        stockLimitReached = true;
-        return prevCart;
+      if (isTabletAccurateProduct) {
+        // Tablet-aware check: every reservation already in the cart for this
+        // product (Box, Strip, or Tablet) is converted into tablets, and
+        // checked against real available tablets — which accounts for
+        // whatever's already been sold off a currently-open strip. This is
+        // what stops a strip sitting at, say, 3 tablets left from being
+        // added to the cart as a full-price "full" strip or box.
+        let tabletsInCart = 0;
+        prevCart.forEach((item) => {
+          if (item.productId === targetProduct.id?.toString()) {
+            tabletsInCart += item.type === "Tablet"
+              ? item.qty
+              : item.rawUnits * item.qty * tabletsPerStripForCheck;
+          }
+        });
+        const openStripTablets = parseInt(targetProduct.openStripTablets) || 0;
+        const availableTablets = (trueTotalUnits * tabletsPerStripForCheck) - openStripTablets;
+        const tabletsNeeded = unitsNeeded * tabletsPerStripForCheck;
+
+        if (tabletsInCart + tabletsNeeded > availableTablets) {
+          stockLimitReached = true;
+          return prevCart;
+        }
+      } else {
+        let currentUnitsInCart = 0;
+        prevCart.forEach((item) => {
+          if (item.productId === targetProduct.id?.toString()) {
+            currentUnitsInCart += item.rawUnits * item.qty;
+          }
+        });
+
+        if (currentUnitsInCart + unitsNeeded > trueTotalUnits) {
+          stockLimitReached = true;
+          return prevCart;
+        }
       }
 
       const existingItemIndex = prevCart.findIndex(
@@ -752,8 +986,8 @@ function App() {
       const boxes = Math.floor(trueTotalUnits / packFactor);
       const strips = trueTotalUnits % packFactor;
       showNotification(
-        "Insufficient Stock",
-        `Only ${boxes} Box(es) and ${strips} Strip(s) remaining in slots.`,
+"Not Enough Stock",
+        `Only ${boxes} Box(es) and ${strips} Strip(s) left in stock.`,
         "warning",
       );
       return;
@@ -799,20 +1033,26 @@ function App() {
           discountPercent: parseFloat(discountPercent) || 0,
           discountDeduction: totalDiscountDeduction,
           grandTotal: grandTotalDue,
+          skipPrint: noPrintMode,
         });
 
-        showNotification(
+showNotification(
           "Transaction Complete",
-          "Sale logged and printed smoothly!",
+          noPrintMode ? "Sale saved successfully! (No receipt printed)" : "Sale saved and printed successfully!",
           "success",
         );
         setCart([]);
         setDiscountPercent("");
         setActiveProducts([]);
+        // Safety net: No-Print applies to this one sale only — it resets to
+        // OFF (print) after every completed transaction, on whichever
+        // terminal made the sale, so it can never be accidentally left on
+        // for the next customer.
+        setNoPrintMode(false);
         refreshStockLedger();
         refreshSalesHistory();
       } catch (err) {
-        showNotification("Checkout Failed", err.message, "error");
+        showNotification("Checkout Failed", friendlyErrorMessage(err, "This sale couldn't be completed. Please try again."), "error");
       } finally {
         setIsProcessingSale(false);
       }
@@ -847,13 +1087,13 @@ function App() {
           const newAttempts = attempts + 1;
           setAttempts(newAttempts);
           if (newAttempts >= 3) {
-            setAuthError("Account locked. Please restart the app.");
+setAuthError("Access locked. Please restart the app.");
           } else {
-            setAuthError(`${message}. Attempts remaining: ${3 - newAttempts}`);
+            setAuthError(`Incorrect username or password. ${3 - newAttempts} attempt(s) left.`);
           }
         }
       } catch (err) {
-        setAuthError(err.message || "Authentication service connection failed.");
+setAuthError(friendlyErrorMessage(err, "Could not connect to the system. Please check the main computer is on."));
       }
     }
   };
@@ -885,15 +1125,15 @@ function App() {
           const newAttempts = vaultAttempts + 1;
           setVaultAttempts(newAttempts);
 
-          showNotification("Security Violation",
+          showNotification("Access Denied",
             newAttempts >= 3
-              ? "Vault access permanently locked for this session."
-              : `${message}. Attempts remaining: ${3 - newAttempts}`,
+              ? "Access is locked for this session. Please restart the app."
+              : `Incorrect PIN. ${3 - newAttempts} attempt(s) left.`,
             "error"
           );
         }
       } catch (err) {
-        showNotification("Error", "Vault authentication failed.", "error");
+showNotification("Error", "Could not verify your PIN. Please try again.", "error");
       }
     }
   };
@@ -1425,6 +1665,30 @@ function App() {
 
         {/* RIGHT ACTION BUTTONS */}
         <div className="flex items-center gap-2 md:gap-4">
+          {/* NO-PRINT TOGGLE — default OFF (receipts print normally).
+              When ON, checkout still records the sale exactly as usual;
+              only the print job is skipped. Session-only, resets on reload. */}
+          {currentTab === "sales" && (
+            <button
+              type="button"
+              onClick={() => setNoPrintMode((prev) => !prev)}
+              title={noPrintMode ? "Receipt printing is OFF for checkouts" : "Receipt printing is ON (default)"}
+              className={`flex items-center gap-2 px-3 py-2 rounded-xl border text-xs font-bold transition-colors ${
+                noPrintMode
+                  ? (lightMode ? "bg-amber-100 border-amber-300 text-amber-700" : "bg-amber-500/10 border-amber-500/30 text-amber-400")
+                  : (lightMode ? "bg-slate-50 border-slate-200 text-slate-500" : "bg-slate-800 border-slate-700 text-slate-400")
+              }`}
+            >
+              <span className="material-symbols-outlined text-[18px]">
+                {noPrintMode ? "print_disabled" : "print"}
+              </span>
+              <span className="hidden md:inline uppercase tracking-wider">No Print</span>
+              <span className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${noPrintMode ? "bg-amber-500" : lightMode ? "bg-slate-300" : "bg-slate-600"}`}>
+                <span className={`inline-block h-3 w-3 transform rounded-full bg-white shadow transition-transform ${noPrintMode ? "translate-x-3.5" : "translate-x-0.5"}`} />
+              </span>
+            </button>
+          )}
+
           {/* CART DRAWER TOGGLE */}
           {currentTab === "sales" && (
             <button
@@ -1567,8 +1831,8 @@ function App() {
                       <SalesCounter
                         key={product.id || `active-card-${index}`}
                         activeProduct={product}
-                        onAddItem={(prod, type) =>
-                          handleAddItemToCart(prod, type)
+                        onAddItem={(prod, type, tabletQty) =>
+                          handleAddItemToCart(prod, type, tabletQty)
                         }
                         onDismiss={() => handleDismissProduct(product.id)}
                         lightMode={lightMode}
@@ -1703,21 +1967,52 @@ function App() {
                                   const dbMatch = inventory.find((p) => p.id.toString() === item.productId);
                                   const activeMatch = activeProducts.find((p) => p.id === item.productId);
                                   const maxTotalUnits = dbMatch ? dbMatch.totalUnits : (activeMatch ? activeMatch.totalUnitsAvailable : 0);
+                                  const tabletsPerStripForItem = parseInt((dbMatch && dbMatch.tabletsPerStrip) || (activeMatch && activeMatch.tabletsPerStrip)) || 0;
 
-                                  let currentUnitsInCart = 0;
-                                  cart.forEach((cItem) => {
-                                    if (cItem.productId === item.productId)
-                                      currentUnitsInCart +=
-                                        cItem.rawUnits * cItem.qty;
-                                  });
+                                  if (tabletsPerStripForItem > 0) {
+                                    // Tablet-aware check — same math as the initial Add
+                                    // click. Converts every cart line for this product
+                                    // (Box/Strip/Tablet) into tablets and checks against
+                                    // real available tablets, which accounts for
+                                    // whatever's already been sold off a currently-open
+                                    // strip. This is what stops "+" from silently pushing
+                                    // past real stock before an error ever shows up.
+                                    const openStripTablets = parseInt((dbMatch && dbMatch.openStripTablets) || (activeMatch && activeMatch.openStripTablets)) || 0;
+                                    let tabletsInCart = 0;
+                                    cart.forEach((cItem) => {
+                                      if (cItem.productId === item.productId) {
+                                        tabletsInCart += cItem.type === "Tablet"
+                                          ? cItem.qty
+                                          : cItem.rawUnits * cItem.qty * tabletsPerStripForItem;
+                                      }
+                                    });
+                                    const availableTablets = (maxTotalUnits * tabletsPerStripForItem) - openStripTablets;
+                                    const tabletsNeededForOneMore = item.type === "Tablet" ? 1 : item.rawUnits * tabletsPerStripForItem;
 
-                                  if (currentUnitsInCart + item.rawUnits > maxTotalUnits) {
-                                    showNotification(
-                                      "Limit Exceeded",
-                                      "Insufficient inventory stock to add more.",
-                                      "warning",
-                                    );
-                                    return;
+                                    if (tabletsInCart + tabletsNeededForOneMore > availableTablets) {
+                                      showNotification(
+                                        "Limit Exceeded",
+                                        "Insufficient inventory stock to add more.",
+                                        "warning",
+                                      );
+                                      return;
+                                    }
+                                  } else {
+                                    let currentUnitsInCart = 0;
+                                    cart.forEach((cItem) => {
+                                      if (cItem.productId === item.productId)
+                                        currentUnitsInCart +=
+                                          cItem.rawUnits * cItem.qty;
+                                    });
+
+                                    if (currentUnitsInCart + item.rawUnits > maxTotalUnits) {
+                                      showNotification(
+                                        "Limit Exceeded",
+                                        "Insufficient inventory stock to add more.",
+                                        "warning",
+                                      );
+                                      return;
+                                    }
                                   }
                                   setCart((prevCart) =>
                                     prevCart.map((i) =>
@@ -1941,6 +2236,7 @@ function App() {
                   inventory={inventory}
                   salesHistory={salesHistory}
                   lightMode={lightMode}
+                  onDeleteReturnTranscript={handleDeleteReturnTranscript}
                 />
               )}
             </div>

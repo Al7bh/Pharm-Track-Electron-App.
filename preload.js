@@ -24,6 +24,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   processCheckout: (payload) => ipcRenderer.invoke('process-checkout', payload),
   searchSalesHistory: (query) => ipcRenderer.invoke('searchSalesHistory', query),
   returnSaleItem: (payload) => ipcRenderer.invoke('returnSaleItem', payload),
+  // Deletes a return transcript (RET-... row) outright — no inventory
+  // reversal. See performDeleteReturnTranscript in main.js.
+  deleteReturnTranscript: (returnId) => ipcRenderer.invoke('deleteReturnTranscript', returnId),
   // Pass a saleId to reprint that invoice, or omit it for the last sale.
   reprintReceipt: (saleId) => ipcRenderer.invoke('reprintReceipt', saleId),
 

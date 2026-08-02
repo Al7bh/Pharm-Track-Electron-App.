@@ -1,5 +1,25 @@
 import React, { useState, useEffect } from "react";
 
+// Translates raw technical error text (SQL errors, network failures, etc.)
+// into plain language before it's ever shown to a non-technical user. Same
+// approach as App.jsx's friendlyErrorMessage — kept local here since this
+// component doesn't have access to App.jsx's closures.
+const friendlyErrorText = (err, fallback) => {
+  const raw = (err && err.message ? err.message : "").toString();
+  if (!raw) return fallback;
+  const patterns = [
+    [/sqlite_constraint.*unique/i, "This record already exists."],
+    [/sqlite|database is locked|no such table|no such column/i, "There was a problem saving to the database. Please try again."],
+    [/econnrefused|failed to fetch|networkerror|network error|fetch failed/i, "Couldn't reach the main computer. Please check the network connection."],
+    [/etimedout|timeout/i, "The request took too long. Please check the connection and try again."],
+    [/unexpected token|json/i, "Received an unexpected response. Please try again."],
+  ];
+  for (const [pattern, friendly] of patterns) {
+    if (pattern.test(raw)) return friendly;
+  }
+  return fallback || "Something went wrong. Please try again.";
+};
+
 function SalesHistory({
   salesHistory = [],
   onTriggerRefresh,
@@ -13,7 +33,7 @@ function SalesHistory({
   const [isReprinting, setIsReprinting] = useState(false);
   const [isReturning, setIsReturning] = useState(false);
 
-  const [rowsPerPage, setRowsPerPage] = useState(10);
+  const [rowsPerPage, setRowsPerPage] = useState(50);
   const [currentPage, setCurrentPage] = useState(1);
   const [selectedInvoice, setSelectedInvoice] = useState(null);
 
@@ -92,11 +112,11 @@ function SalesHistory({
       if (res && res.success) {
         if (onNotify) onNotify("Receipt Sent", `Invoice INV-${res.saleId} was sent to the printer.`, "success");
       } else {
-        if (onNotify) onNotify("Reprint Failed", (res && res.message) || "Could not reprint this receipt.", "error");
-      }
-    } catch (err) {
-      if (onNotify) onNotify("Reprint Failed", err.message || "Printer or server unreachable.", "error");
-    } finally {
+if (onNotify) onNotify("Reprint Failed", (res && res.message) || "Could not reprint this receipt.", "error");
+    }
+  } catch (err) {
+    if (onNotify) onNotify("Reprint Failed", friendlyErrorText(err, "Could not reach the printer. Please check the main computer."), "error");
+  } finally {
       setIsReprinting(false);
     }
   };
@@ -172,8 +192,16 @@ function SalesHistory({
         try { itemsArray = JSON.parse(sale.itemsJson) || []; } catch (err) { return; }
 
         const bulkItemsToRestock = itemsArray.map(cartItem => ({
-            productId: cartItem.productId || cartItem.id, 
-            unitsToReturn: (cartItem.rawUnits || 1) * cartItem.qty
+            productId: cartItem.productId || cartItem.id,
+            type: cartItem.type,
+            // unitsToReturn (strip-equivalent) is used for Box/Strip lines
+            // and for any non-tablet product — unchanged from before.
+            unitsToReturn: (cartItem.rawUnits || 1) * cartItem.qty,
+            // For Tablet lines, qty IS the tablet count (see App.jsx cart
+            // logic) — sent separately so the backend can restock through
+            // the tablet accumulator instead of adding a fractional
+            // strip-equivalent value straight into totalUnits.
+            tabletQty: cartItem.type === "Tablet" ? cartItem.qty : undefined,
         }));
 
         await window.electronAPI.returnSaleItem({
@@ -241,7 +269,12 @@ function SalesHistory({
 
         await window.electronAPI.returnSaleItem({
           saleId: sale.id,
-          returnItems: [{ productId: restockTargetId, unitsToReturn: underlyingUnitsReturned }], 
+          returnItems: [{
+            productId: restockTargetId,
+            type: item.type,
+            unitsToReturn: underlyingUnitsReturned,
+            tabletQty: item.type === "Tablet" ? qtyToReturn : undefined,
+          }],
           remainingItemsJson: JSON.stringify(updatedCartItems),
           returnedItemsJson: JSON.stringify([{ ...item, qty: qtyToReturn }]), 
           newSubtotal,
@@ -257,10 +290,11 @@ function SalesHistory({
       }
     } catch (err) {
       console.error("Return failed:", err);
+      const friendly = friendlyErrorText(err, "This return couldn't be processed. Please try again.");
       if (onNotify) {
-        onNotify("Return Failed", err.message || "Database lock or write error.", "error");
+        onNotify("Return Failed", friendly, "error");
       } else {
-        alert(`SYSTEM ERROR: Return processing failed.\nReason: ${err.message || 'Database lock or write error.'}`);
+        alert(`This return couldn't be processed.\n${friendly}`);
       }
     } finally {
       setIsReturning(false);
@@ -447,9 +481,9 @@ function SalesHistory({
           <div className="flex items-center gap-2 text-slate-400">
             <span>Rows per page:</span>
             <select value={rowsPerPage} onChange={(e) => { setRowsPerPage(parseInt(e.target.value)); setCurrentPage(1); }} className={`py-1 px-2 border rounded-lg focus:outline-none font-bold ${lightMode ? "bg-white border-slate-200 text-slate-700" : "bg-slate-900 border-slate-800 text-slate-300"}`}>
-              <option value={10}>10</option>
-              <option value={20}>20</option>
               <option value={50}>50</option>
+              <option value={100}>100</option>
+              <option value={150}>150</option>
             </select>
           </div>
           <div className="text-slate-400 font-mono">

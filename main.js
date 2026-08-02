@@ -114,6 +114,16 @@ if (IS_SERVER) {
     db.run(`ALTER TABLE inventory ADD COLUMN intake_time TEXT`, () => {});
     db.run(`ALTER TABLE inventory ADD COLUMN is_active INTEGER DEFAULT 1`, () => {});
     db.run(`ALTER TABLE inventory ADD COLUMN barcode TEXT`, () => {});
+    // Feature: tablet-level sales. tabletsPerStrip is the conversion ratio
+    // (how many tablets make up one strip) — NULL/0 means this product is
+    // not sellable by the tablet, and the sales screen only shows the
+    // existing Box/Strip options for it, unchanged.
+    // openStripTablets tracks tablets already sold off the currently-open
+    // strip since the last time a full strip was deducted from totalUnits.
+    // totalUnits itself stays exactly as it works today (strip-based) —
+    // this is a separate running counter, not a redefinition of it.
+    db.run(`ALTER TABLE inventory ADD COLUMN tabletsPerStrip INTEGER DEFAULT 0`, () => {});
+    db.run(`ALTER TABLE inventory ADD COLUMN openStripTablets INTEGER DEFAULT 0`, () => {});
 
     // Without these, every barcode scan and every 5s inventory/history poll
     // does a full table scan. Cheap to create, and IF NOT EXISTS makes it a
@@ -246,8 +256,8 @@ if (IS_SERVER) {
     const item = req.body;
     const ts = new Date().toISOString();
     db.run(
-      `INSERT INTO inventory (barcode, name, generic, batch, expiry, totalUnits, factor, buyingPrice, retailPrice, category, intake_time, is_active) VALUES (?,?,?,?,?,?,?,?,?,?,?,1)`,
-      [item.barcode || '', item.name, item.generic, item.batch, item.expiry, item.totalUnits, item.factor, item.buyingPrice, item.retailPrice, item.category, ts],
+      `INSERT INTO inventory (barcode, name, generic, batch, expiry, totalUnits, factor, buyingPrice, retailPrice, category, intake_time, is_active, tabletsPerStrip) VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?)`,
+      [item.barcode || '', item.name, item.generic, item.batch, item.expiry, item.totalUnits, item.factor, item.buyingPrice, item.retailPrice, item.category, ts, parseInt(item.tabletsPerStrip) || 0],
       function (err) {
         if (err) return res.status(500).json({ error: err.message });
         res.json({ success: true, id: this.lastID.toString() });
@@ -258,8 +268,8 @@ if (IS_SERVER) {
   expressApp.put('/api/inventory/:id', (req, res) => {
     const item = req.body;
     db.run(
-      `UPDATE inventory SET barcode=?, name=?, generic=?, batch=?, expiry=?, totalUnits=?, factor=?, buyingPrice=?, retailPrice=?, category=? WHERE id=?`,
-      [item.barcode || '', item.name, item.generic, item.batch, item.expiry, parseInt(item.totalUnits) || 0, parseInt(item.factor) || 10, parseFloat(item.buyingPrice) || 0, parseFloat(item.retailPrice) || 0, item.category, req.params.id],
+      `UPDATE inventory SET barcode=?, name=?, generic=?, batch=?, expiry=?, totalUnits=?, factor=?, buyingPrice=?, retailPrice=?, category=?, tabletsPerStrip=? WHERE id=?`,
+      [item.barcode || '', item.name, item.generic, item.batch, item.expiry, parseInt(item.totalUnits) || 0, parseInt(item.factor) || 10, parseFloat(item.buyingPrice) || 0, parseFloat(item.retailPrice) || 0, item.category, parseInt(item.tabletsPerStrip) || 0, req.params.id],
       function (err) {
         if (err) return res.status(500).json({ error: err.message });
         res.json({ success: true });
@@ -321,6 +331,12 @@ if (IS_SERVER) {
       .catch((err) => res.status(err.statusCode || 500).json({ error: err.message }));
   });
 
+  expressApp.delete('/api/returns/:id', (req, res) => {
+    performDeleteReturnTranscript(req.params.id)
+      .then((result) => res.json(result))
+      .catch((err) => res.status(err.statusCode || 500).json({ error: err.message }));
+  });
+
   // Reprint an existing receipt on the server's printer. Client machines call
   // this; the printer lives on the server PC so the print always happens here.
   expressApp.post('/api/reprint', (req, res) => {
@@ -378,6 +394,10 @@ if (IS_SERVER) {
 // =================================================================
 // RECEIPT PRINTING (SERVER ONLY — printer is attached to server PC)
 // =================================================================
+// Cached once — avoids reading + base64-encoding the logo from disk on
+// every single fallback print. Small win, but adds up on high-volume days.
+let cachedLogoHtml = null;
+
 function triggerReceiptPrint(cleanSaleId, timestamp, cartItems, subtotal, discountDeduction, grandTotal) {
   try {
     const bwipjs = require('bwip-js');
@@ -389,21 +409,26 @@ function triggerReceiptPrint(cleanSaleId, timestamp, cartItems, subtotal, discou
 
     // Load logo as base64 so it works both in dev and packaged builds
     let logoHtml = '';
-    try {
-      const logoPath = app.isPackaged
-        ? path.join(process.resourcesPath, 'assets', 'receipt-logo.png')
-        : fs.existsSync(path.join(__dirname, 'assets', 'receipt-logo.png'))
-          ? path.join(__dirname, 'assets', 'receipt-logo.png')
-          : path.join(__dirname, 'frontend', 'src', 'assets', 'receipt-logo.png');
-      if (fs.existsSync(logoPath)) {
-        const logoBase64 = fs.readFileSync(logoPath).toString('base64');
-        logoHtml = `<div style="text-align:center;margin-bottom:4px;">
+    if (cachedLogoHtml !== null) {
+      logoHtml = cachedLogoHtml;
+    } else {
+      try {
+        const logoPath = app.isPackaged
+          ? path.join(process.resourcesPath, 'assets', 'receipt-logo.png')
+          : fs.existsSync(path.join(__dirname, 'assets', 'receipt-logo.png'))
+            ? path.join(__dirname, 'assets', 'receipt-logo.png')
+            : path.join(__dirname, 'frontend', 'src', 'assets', 'receipt-logo.png');
+        if (fs.existsSync(logoPath)) {
+          const logoBase64 = fs.readFileSync(logoPath).toString('base64');
+          logoHtml = `<div style="text-align:center;margin-bottom:4px;">
           <img src="data:image/png;base64,${logoBase64}"
                style="width:80px;height:80px;object-fit:contain;" alt="Logo" />
         </div>`;
+        }
+      } catch (logoErr) {
+        // Logo load failed — fall through to text header silently
       }
-    } catch (logoErr) {
-      // Logo load failed — fall through to text header silently
+      cachedLogoHtml = logoHtml; // cache even '' so a missing logo doesn't retry fs on every print
     }
 
     // Calculate total item discounts and global discount for proportional distribution
@@ -845,7 +870,16 @@ async function resolveReceiptPrinterName() {
   if (sysConfig.printerName) return sysConfig.printerName;
   if (!mainWindow || mainWindow.isDestroyed()) return null;
   const printers = await mainWindow.webContents.getPrintersAsync();
-  const thermal = printers.find((pr) => /copper|thermal|80\s?mm|pos-?\d|receipt/i.test(pr.name));
+  // Previously this only matched generic words like "thermal" or "80mm",
+  // which most real thermal receipt printers don't have in their driver
+  // name — e.g. "EPSON TM-T88V", "XP-58", "Rongta RP80", "POS-X", "Zjiang
+  // ZJ-5890", "SNBC BTP", "Star TSP100", "Bixolon SRP", "Gprinter GP-".
+  // Those were silently missing this check and falling all the way through
+  // to the slow HTML print path (with the logo) on every single receipt.
+  // Matching known thermal-printer brand/model prefixes fixes that.
+  const thermal = printers.find((pr) =>
+    /copper|thermal|80\s?mm|58\s?mm|pos-?\d|pos-?x|receipt|epson|tm-t|xprinter|\bxp-?\d|rongta|\brp\d|zjiang|\bzj-?\d|snbc|\bbtp|star\s?tsp|bixolon|\bsrp-?\d|gprinter|\bgp-?\d|citizen\s?ct|custom\s?vkp/i.test(pr.name)
+  );
   if (thermal) return thermal.name;
   const def = printers.find((pr) => pr.isDefault);
   if (def && !/pdf|xps|onenote|fax/i.test(def.name)) return def.name;
@@ -1365,8 +1399,8 @@ ipcMain.handle('addInventory', async (event, newItem) => {
   return new Promise((resolve, reject) => {
     const ts = new Date().toISOString();
     db.run(
-      `INSERT INTO inventory (barcode, name, generic, batch, expiry, totalUnits, factor, buyingPrice, retailPrice, category, intake_time, is_active) VALUES (?,?,?,?,?,?,?,?,?,?,?,1)`,
-      [newItem.barcode || '', newItem.name, newItem.generic, newItem.batch, newItem.expiry, newItem.totalUnits, newItem.factor, newItem.buyingPrice, newItem.retailPrice, newItem.category, ts],
+      `INSERT INTO inventory (barcode, name, generic, batch, expiry, totalUnits, factor, buyingPrice, retailPrice, category, intake_time, is_active, tabletsPerStrip) VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?)`,
+      [newItem.barcode || '', newItem.name, newItem.generic, newItem.batch, newItem.expiry, newItem.totalUnits, newItem.factor, newItem.buyingPrice, newItem.retailPrice, newItem.category, ts, parseInt(newItem.tabletsPerStrip) || 0],
       function (err) { if (err) reject(err); else resolve({ success: true, id: this.lastID.toString() }); }
     );
   });
@@ -1376,8 +1410,8 @@ ipcMain.handle('updateInventory', async (event, item) => {
   if (IS_CLIENT) return networkCall('PUT', `/api/inventory/${item.id}`, item, sysConfig);
   return new Promise((resolve, reject) => {
     db.run(
-      `UPDATE inventory SET barcode=?,name=?,generic=?,batch=?,expiry=?,totalUnits=?,factor=?,buyingPrice=?,retailPrice=?,category=? WHERE id=?`,
-      [item.barcode || '', item.name, item.generic, item.batch, item.expiry, parseInt(item.totalUnits) || 0, parseInt(item.factor) || 10, parseFloat(item.buyingPrice) || 0, parseFloat(item.retailPrice) || 0, item.category, item.id.toString()],
+      `UPDATE inventory SET barcode=?,name=?,generic=?,batch=?,expiry=?,totalUnits=?,factor=?,buyingPrice=?,retailPrice=?,category=?,tabletsPerStrip=? WHERE id=?`,
+      [item.barcode || '', item.name, item.generic, item.batch, item.expiry, parseInt(item.totalUnits) || 0, parseInt(item.factor) || 10, parseFloat(item.buyingPrice) || 0, parseFloat(item.retailPrice) || 0, item.category, parseInt(item.tabletsPerStrip) || 0, item.id.toString()],
       function (err) { if (err) reject(err); else resolve({ success: true }); }
     );
   });
@@ -1402,6 +1436,11 @@ ipcMain.handle('deleteInventory', async (event, itemId) => {
       if (err) reject(err); else resolve({ success: true });
     });
   });
+});
+
+ipcMain.handle('deleteReturnTranscript', async (event, returnId) => {
+  if (IS_CLIENT) return networkCall('DELETE', `/api/returns/${returnId}`, null, sysConfig);
+  return performDeleteReturnTranscript(returnId);
 });
 
 ipcMain.handle('getSalesHistory', async () => {
@@ -1489,6 +1528,9 @@ function performCheckout(payload) {
   const discountPercent = parseFloat(payload.discountPercent) || 0;
   const discountDeduction = parseFloat(payload.discountDeduction) || 0;
   const grandTotal = parseFloat(payload.grandTotal) || 0;
+  // No-Print toggle (top-right of the Sales tab): the transaction is still
+  // recorded exactly as normal — only the trailing print call is skipped.
+  const skipPrint = !!(!Array.isArray(payload) && payload.skipPrint);
   const timestamp = new Date().toISOString();
 
   return queueWrite((resolve, reject) => {
@@ -1516,31 +1558,106 @@ function performCheckout(payload) {
             function (insertErr) {
               if (insertErr) return fail(insertErr);
 
-              const stmt = db.prepare(`UPDATE inventory SET totalUnits = totalUnits - ? WHERE id = ? AND totalUnits >= ?`);
+              // Grouped by product and processed sequentially per product,
+              // so multiple lines for the same product see each other's
+              // effect, and each product needs only one read of its current
+              // stock state.
+              const productIds = [...new Set(
+                cartItems.map((item) => item.productId).filter(Boolean).map((id) => id.toString())
+              )];
               let shortItem = null;
-              cartItems.forEach((item) => {
-                const units = (parseInt(item.rawUnits) || 0) * (parseInt(item.qty) || 0);
-                if (units <= 0 || !item.productId) return;
-                stmt.run([units, item.productId.toString(), units], function (stmtErr) {
-                  if (stmtErr || this.changes === 0) shortItem = shortItem || (item.name || 'an item');
-                });
+
+              const dbGet = (sql, params) => new Promise((res, rej) => {
+                db.get(sql, params, (e, r) => (e ? rej(e) : res(r)));
+              });
+              const dbRun = (sql, params) => new Promise((res, rej) => {
+                db.run(sql, params, function (e) { e ? rej(e) : res(this); });
               });
 
-              stmt.finalize((finalizeErr) => {
-                if (finalizeErr || shortItem) {
-                  // Name the offending product — the old message never did.
-                  const e = new Error(
-                    finalizeErr ? finalizeErr.message : `Insufficient stock for "${shortItem}". The sale was not saved.`
+              const processProduct = async (productId) => {
+                const items = cartItems.filter((item) => item.productId && item.productId.toString() === productId);
+                const row = await dbGet(
+                  `SELECT totalUnits, tabletsPerStrip, openStripTablets FROM inventory WHERE id = ?`,
+                  [productId]
+                );
+                if (!row) { shortItem = shortItem || (items[0] && items[0].name) || 'an item'; return; }
+
+                const tabletsPerStrip = parseInt(row.tabletsPerStrip) || 0;
+
+                if (tabletsPerStrip > 0) {
+                  // Unified tablet-accumulator path. Box and Strip lines are
+                  // converted to a tablet count too (Strip = tabletsPerStrip
+                  // tablets, Box = packFactor × tabletsPerStrip), and run
+                  // through the exact same accumulator as a direct Tablet
+                  // sale. This is what stops a partially-open strip (e.g. 3
+                  // tablets left) from being sold as a full-price "Add Loose
+                  // Strip" — that sale now correctly consumes the 3 leftover
+                  // tablets first and opens into the next strip for the rest,
+                  // instead of blindly taking 1 whole strip off totalUnits.
+                  let runningTotalUnits = parseInt(row.totalUnits) || 0;
+                  let runningOpen = parseInt(row.openStripTablets) || 0;
+
+                  for (const item of items) {
+                    const tabletCount = item.type === 'Tablet'
+                      ? (parseInt(item.qty) || 0)
+                      : (parseInt(item.rawUnits) || 0) * (parseInt(item.qty) || 0) * tabletsPerStrip;
+                    if (tabletCount <= 0) continue;
+
+                    const availableTablets = (runningTotalUnits * tabletsPerStrip) - runningOpen;
+                    if (tabletCount > availableTablets) {
+                      shortItem = shortItem || (item.name || 'an item');
+                      return;
+                    }
+
+                    const combined = runningOpen + tabletCount;
+                    runningTotalUnits -= Math.floor(combined / tabletsPerStrip);
+                    runningOpen = combined % tabletsPerStrip;
+                  }
+
+                  const result = await dbRun(
+                    `UPDATE inventory SET totalUnits = ?, openStripTablets = ? WHERE id = ? AND totalUnits >= 0`,
+                    [runningTotalUnits, runningOpen, productId]
                   );
-                  e.statusCode = finalizeErr ? 500 : 409;
-                  return fail(e);
+                  if (result.changes === 0) shortItem = shortItem || (items[0] && items[0].name) || 'an item';
+                } else {
+                  // Unchanged path — products without tabletsPerStrip
+                  // configured deduct totalUnits directly by Box/Strip units,
+                  // exactly as before.
+                  for (const item of items) {
+                    const units = (parseInt(item.rawUnits) || 0) * (parseInt(item.qty) || 0);
+                    if (units <= 0) continue;
+                    const result = await dbRun(
+                      `UPDATE inventory SET totalUnits = totalUnits - ? WHERE id = ? AND totalUnits >= ?`,
+                      [units, productId, units]
+                    );
+                    if (result.changes === 0) { shortItem = shortItem || (item.name || 'an item'); return; }
+                  }
                 }
-                db.run('COMMIT', (commitErr) => {
-                  if (commitErr) return fail(commitErr);
-                  printReceipt(cleanSaleId, timestamp, cartItems, subtotal, discountDeduction, grandTotal);
-                  succeed({ success: true, saleId: cleanSaleId });
-                });
-              });
+              };
+
+              const deductAll = async () => {
+                for (const pid of productIds) {
+                  if (shortItem) return;
+                  await processProduct(pid);
+                }
+              };
+
+              deductAll()
+                .then(() => {
+                  if (shortItem) {
+                    const e = new Error(`Insufficient stock for "${shortItem}". The sale was not saved.`);
+                    e.statusCode = 409;
+                    return fail(e);
+                  }
+                  db.run('COMMIT', (commitErr) => {
+                    if (commitErr) return fail(commitErr);
+                    if (!skipPrint) {
+                      printReceipt(cleanSaleId, timestamp, cartItems, subtotal, discountDeduction, grandTotal);
+                    }
+                    succeed({ success: true, saleId: cleanSaleId });
+                  });
+                })
+                .catch((e) => fail(e));
             }
           );
         }
@@ -1598,18 +1715,83 @@ function performReturn(payload) {
     db.run('BEGIN IMMEDIATE', (beginErr) => {
       if (beginErr) return reject(beginErr);
 
-      const stmt = db.prepare(`UPDATE inventory SET totalUnits = totalUnits + ?, is_active = 1 WHERE id = ?`);
-      let restockErr = null;
-      returnItems.forEach((item) => {
-        const targetId = item.productId || item.id;
-        if (!targetId) return;
-        stmt.run([parseInt(item.unitsToReturn) || 0, targetId.toString()], function (err) {
-          if (err) restockErr = restockErr || err;
-        });
+      const dbGet = (sql, params) => new Promise((res, rej) => {
+        db.get(sql, params, (e, r) => (e ? rej(e) : res(r)));
+      });
+      const dbRun = (sql, params) => new Promise((res, rej) => {
+        db.run(sql, params, function (e) { e ? rej(e) : res(this); });
       });
 
-      stmt.finalize((finErr) => {
-        if (finErr || restockErr) return fail(new Error('Failed to restock returned items.'));
+      // Reverses the exact accumulator used to deduct a sale (see
+      // performCheckout): giving back `tabletsToRestock` tablets first fills
+      // back into the currently-open strip; if that pushes the open count
+      // below zero, it borrows back a whole strip at a time. This is what
+      // stops a tablet-sale return from just adding a fractional
+      // strip-equivalent number straight into totalUnits (which corrupted
+      // it — totalUnits must always stay a whole number of strips).
+      const reverseAccumulator = (totalUnits, openStripTablets, tabletsPerStrip, tabletsToRestock) => {
+        let units = totalUnits;
+        let open = openStripTablets - tabletsToRestock;
+        while (open < 0) {
+          open += tabletsPerStrip;
+          units += 1;
+        }
+        return { totalUnits: units, openStripTablets: open };
+      };
+
+      const restockOne = async (item) => {
+        const targetId = (item.productId || item.id);
+        if (!targetId) return;
+        const productId = targetId.toString();
+
+        const row = await dbGet(
+          `SELECT totalUnits, tabletsPerStrip, openStripTablets FROM inventory WHERE id = ?`,
+          [productId]
+        );
+        if (!row) return; // product may have been deleted since — nothing to restock against
+
+        const tabletsPerStrip = parseInt(row.tabletsPerStrip) || 0;
+
+        if (tabletsPerStrip > 0) {
+          // Tablet-enabled product: convert this line to a tablet quantity
+          // (Tablet lines carry their own exact count; Box/Strip lines use
+          // the same strip-equivalent × tabletsPerStrip conversion used at
+          // checkout) and restock through the reverse accumulator.
+          const tabletsToRestock = item.type === 'Tablet'
+            ? (parseInt(item.tabletQty) || 0)
+            : (parseFloat(item.unitsToReturn) || 0) * tabletsPerStrip;
+          if (tabletsToRestock <= 0) return;
+
+          const { totalUnits, openStripTablets } = reverseAccumulator(
+            parseInt(row.totalUnits) || 0,
+            parseInt(row.openStripTablets) || 0,
+            tabletsPerStrip,
+            tabletsToRestock
+          );
+          await dbRun(
+            `UPDATE inventory SET totalUnits = ?, openStripTablets = ?, is_active = 1 WHERE id = ?`,
+            [totalUnits, openStripTablets, productId]
+          );
+        } else {
+          // Unchanged path — non-tablet products restock totalUnits
+          // directly, exactly as before.
+          const units = parseInt(item.unitsToReturn) || 0;
+          if (units <= 0) return;
+          await dbRun(
+            `UPDATE inventory SET totalUnits = totalUnits + ?, is_active = 1 WHERE id = ?`,
+            [units, productId]
+          );
+        }
+      };
+
+      (async () => {
+        try {
+          for (const item of returnItems) {
+            await restockOne(item);
+          }
+        } catch (restockErr) {
+          return fail(new Error('Failed to restock returned items.'));
+        }
 
         // Unique per return: timestamp + random suffix. The HTTP path used to
         // omit the random part, so two returns on one sale inside the same
@@ -1645,8 +1827,37 @@ function performReturn(payload) {
             }
           }
         );
-      });
+      })();
     });
+  });
+}
+
+// Delete a return transcript (a "RET-..." row in sales_history) outright —
+// no modification to inventory or the original sale. Per product decision,
+// this is a plain delete, not a reversal: undoing the stock/refund effects
+// of a return is a separate "cancel return" feature, not implemented here.
+// The id LIKE 'RET-%' guard exists so this endpoint can never be pointed at
+// a real sale row by mistake or malicious input.
+function performDeleteReturnTranscript(returnId) {
+  if (!returnId || !returnId.startsWith('RET-')) {
+    const e = new Error('Not a valid return transcript ID.');
+    e.statusCode = 400;
+    return Promise.reject(e);
+  }
+  return queueWrite((resolve, reject) => {
+    db.run(
+      `DELETE FROM sales_history WHERE id = ? AND id LIKE 'RET-%'`,
+      [returnId],
+      function (err) {
+        if (err) return reject(err);
+        if (this.changes === 0) {
+          const e = new Error('Return transcript not found.');
+          e.statusCode = 404;
+          return reject(e);
+        }
+        resolve({ success: true });
+      }
+    );
   });
 }
 

@@ -16,7 +16,11 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
     strips: "",
     factor: 2,
     buyingPrice: "",
-    retailPrice: ""
+    retailPrice: "",
+    // Feature: tablet-level sales. 0/blank = this product is not sellable
+    // by the tablet — the sales screen shows only the existing Box/Strip
+    // options for it, unchanged. Does NOT affect totalUnits tracking.
+    tabletsPerStrip: ""
   });
 
   const [isEditMode, setIsEditMode] = useState(false);
@@ -27,11 +31,22 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
   const [isRestocking, setIsRestocking] = useState(false);
   // Timestamp of the last keydown, used to tell scanner bursts from real keys.
   const lastKeyTimeRef = useRef(0);
+  // Refs used to restore cursor position after auto-capitalizing the
+  // name/generic fields (see handleInputChange) — without this, inserting
+  // a word before existing text bounces the cursor to the end.
+  const nameInputRef = useRef(null);
+  const genericInputRef = useRef(null);
+  // Separate month/year entry for expiry (see ExpiryDateFields below) so
+  // typing a date never fights a native browser widget mid-entry.
+  const [expiryMonth, setExpiryMonth] = useState("");
+  const [expiryYear, setExpiryYear] = useState("");
 
-  const [rowsPerPage, setRowsPerPage] = useState(10);
+  const [rowsPerPage, setRowsPerPage] = useState(50);
   const [currentPage, setCurrentPage] = useState(1);
   const [stockSearchQuery, setStockSearchQuery] = useState("");
   const [stockFilterMode, setStockFilterMode] = useState("all");
+  const [sortColumn, setSortColumn] = useState(null);
+  const [sortDirection, setSortDirection] = useState("asc");
 
   // ==========================================
   // QUICK-RESTOCK STATES
@@ -222,9 +237,65 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
   const handleInputChange = (e) => {
     let { name, value } = e.target;
     if (name === "name" || name === "generic") {
+      // formatTitleCase only ever changes casing, never length, so the
+      // caret's character offset stays valid after the transform — we
+      // just have to tell the browser to put it back there, since setting
+      // a controlled input's value collapses the selection to the end by
+      // default.
+      const inputEl = e.target;
+      const caret = inputEl.selectionStart;
       value = formatTitleCase(value);
+      setFormData((prev) => ({ ...prev, [name]: value }));
+      requestAnimationFrame(() => {
+        if (document.activeElement === inputEl) {
+          inputEl.setSelectionRange(caret, caret);
+        }
+      });
+      return;
     }
     setFormData((prev) => ({ ...prev, [name]: value }));
+  };
+
+  // ==========================================
+  // EXPIRY DATE — separate Month/Year fields
+  // ==========================================
+  // Keeps Month/Year in sync whenever expiry is set from elsewhere (a
+  // barcode scan, loading an item to edit, or Clear Form).
+  useEffect(() => {
+    if (formData.expiry && /^\d{4}-\d{2}$/.test(formData.expiry)) {
+      const [y, m] = formData.expiry.split("-");
+      setExpiryYear(y);
+      setExpiryMonth(m);
+    } else if (!formData.expiry) {
+      setExpiryYear("");
+      setExpiryMonth("");
+    }
+  }, [formData.expiry]);
+
+  // Only commits into formData.expiry once both Month and Year are
+  // complete — this is what lets the user type at their own pace instead
+  // of the field being force-cleared on an incomplete intermediate value.
+  const commitExpiry = (month, year) => {
+    const monthNum = parseInt(month, 10);
+    const isValidMonth = /^\d{1,2}$/.test(month) && monthNum >= 1 && monthNum <= 12;
+    if (isValidMonth && /^\d{4}$/.test(year)) {
+      const paddedMonth = String(monthNum).padStart(2, "0");
+      setFormData((prev) => ({ ...prev, expiry: `${year}-${paddedMonth}` }));
+    } else if (!month && !year) {
+      setFormData((prev) => ({ ...prev, expiry: "" }));
+    }
+  };
+
+  const handleExpiryMonthChange = (e) => {
+    const month = e.target.value.replace(/\D/g, "").slice(0, 2);
+    setExpiryMonth(month);
+    commitExpiry(month, expiryYear);
+  };
+
+  const handleExpiryYearChange = (e) => {
+    const year = e.target.value.replace(/\D/g, "").slice(0, 4);
+    setExpiryYear(year);
+    commitExpiry(expiryMonth, year);
   };
 
   // ==========================================
@@ -241,9 +312,9 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
     const unitsToAdd = (bToAdd * packFactor) + sToAdd;
 
     if (unitsToAdd <= 0) {
-      setValidationDialog({
+setValidationDialog({
         isOpen: true,
-        message: "Please enter a valid quantity of boxes or strips to restock.",
+        message: "Please enter how many boxes or strips you want to add.",
       });
       return;
     }
@@ -276,7 +347,8 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
       strips: currentStrips || "",
       factor: med.factor || 2,
       buyingPrice: Math.round(med.buyingPrice) || "",
-      retailPrice: Math.round(med.retailPrice) || ""
+      retailPrice: Math.round(med.retailPrice) || "",
+      tabletsPerStrip: med.tabletsPerStrip || ""
     });
   };
 
@@ -293,7 +365,8 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
       strips: "",
       factor: 2,
       buyingPrice: "",
-      retailPrice: ""
+      retailPrice: "",
+      tabletsPerStrip: ""
     });
   };
 
@@ -301,9 +374,17 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
     e.preventDefault();
     if (isSavingStock) return;
     if (!formData.name || !formData.batch || !formData.retailPrice || !formData.buyingPrice) {
+setValidationDialog({
+        isOpen: true,
+        message: "Please fill in Name, Batch, Buying Price, and Retail Price before saving.",
+      });
+      return;
+    }
+
+    if (formData.tabletsPerStrip && (parseInt(formData.tabletsPerStrip) <= 0 || !/^\d+$/.test(formData.tabletsPerStrip))) {
       setValidationDialog({
         isOpen: true,
-        message: "Please complete Name, Batch, Buying Price, and Retail Price before continuing.",
+        message: "Tablets per strip should be a whole number greater than 0 (or left blank if this product isn't sold by the tablet).",
       });
       return;
     }
@@ -312,9 +393,25 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
     const retailPriceRounded = Math.round(parseFloat(formData.retailPrice)) || 0;
 
     if (retailPriceRounded < buyPriceRounded) {
+setValidationDialog({
+        isOpen: true,
+        message: "The selling price cannot be lower than the buying price. Please check your numbers.",
+      });
+      return;
+    }
+
+    if ((expiryMonth || expiryYear) && !formData.expiry) {
       setValidationDialog({
         isOpen: true,
-        message: "Retail Price cannot be lower than Buying Price. Please verify your margins.",
+        message: "The expiry date looks incomplete or invalid — please check the month (1-12) and a 4-digit year.",
+      });
+      return;
+    }
+
+    if (formData.expiry && formData.expiry < minExpiryDateString) {
+      setValidationDialog({
+        isOpen: true,
+        message: "This expiry date is in the past. Please double-check the month and year.",
       });
       return;
     }
@@ -329,10 +426,10 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
         item.batch === formData.batch.trim().toUpperCase()
       );
       
-      if (isDuplicate) {
+if (isDuplicate) {
         setValidationDialog({
           isOpen: true,
-          message: "This specific Barcode and Batch already exists in the system. Please scan it to use the Quick Restock popup instead.",
+          message: "This item (same barcode and batch) already exists. Use the Quick Restock option instead.",
         });
         return;
       }
@@ -351,7 +448,8 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
       totalUnits: totalUnitsCalculated,
       factor: packFactor,
       buyingPrice: buyPriceRounded,
-      retailPrice: retailPriceRounded
+      retailPrice: retailPriceRounded,
+      tabletsPerStrip: parseInt(formData.tabletsPerStrip) || 0
     };
 
     // Only clear the form once the write is confirmed — it used to wipe
@@ -373,6 +471,7 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
     }
     
     if (stockFilterMode === "expiryAlert" && !isExpiringWithinCustomThreshold(med.expiry)) return false;
+    if (stockFilterMode === "outOfStock" && med.totalUnits !== 0) return false;
 
     const query = stockSearchQuery.toLowerCase();
     return (
@@ -383,11 +482,52 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
     );
   });
 
-  const totalFilteredRows = filteredInventory.length;
+  // ==========================================
+  // SORTING
+  // ==========================================
+  const SORT_ACCESSORS = {
+    name: (med) => (med.name || "").toLowerCase(),
+    batch: (med) => (med.batch || "").toLowerCase(),
+    expiry: (med) => med.expiry || "",
+    totalUnits: (med) => med.totalUnits || 0,
+    intake_time: (med) => med.intake_time || "",
+    buyingPrice: (med) => med.buyingPrice || 0,
+    retailPrice: (med) => med.retailPrice || 0,
+  };
+
+  const sortedInventory = React.useMemo(() => {
+    if (!sortColumn || !SORT_ACCESSORS[sortColumn]) return filteredInventory;
+    const accessor = SORT_ACCESSORS[sortColumn];
+    const sorted = [...filteredInventory].sort((a, b) => {
+      const valA = accessor(a);
+      const valB = accessor(b);
+      if (valA < valB) return sortDirection === "asc" ? -1 : 1;
+      if (valA > valB) return sortDirection === "asc" ? 1 : -1;
+      return 0;
+    });
+    return sorted;
+  }, [filteredInventory, sortColumn, sortDirection]);
+
+  const handleSortClick = (column) => {
+    if (sortColumn === column) {
+      setSortDirection((prev) => (prev === "asc" ? "desc" : "asc"));
+    } else {
+      setSortColumn(column);
+      setSortDirection("asc");
+    }
+    setCurrentPage(1);
+  };
+
+  const sortIndicator = (column) => {
+    if (sortColumn !== column) return null;
+    return <span className="ml-1">{sortDirection === "asc" ? "▲" : "▼"}</span>;
+  };
+
+  const totalFilteredRows = sortedInventory.length;
   const totalPagesCount = Math.ceil(totalFilteredRows / rowsPerPage) || 1;
   const indexLastRow = currentPage * rowsPerPage;
   const indexFirstRow = indexLastRow - rowsPerPage;
-  const paginatedInventorySlice = filteredInventory.slice(indexFirstRow, indexLastRow);
+  const paginatedInventorySlice = sortedInventory.slice(indexFirstRow, indexLastRow);
 
   const handlePageChange = (direction) => {
     if (direction === "next" && currentPage < totalPagesCount) setCurrentPage((prev) => prev + 1);
@@ -545,12 +685,12 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
 
             <div className="space-y-1">
               <label className="text-[10px] font-bold uppercase text-slate-400">Medication Name</label>
-              <input id="stock-name-input" type="text" name="name" required maxLength={50} value={formData.name} onChange={handleInputChange} placeholder="e.g. Panadol Extra" className={`w-full border rounded-xl py-2 px-3 text-xs focus:outline-none ${lightMode ? "bg-slate-50 border-slate-200 text-slate-800 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-200 focus:border-emerald-500"}`} />
+              <input ref={nameInputRef} id="stock-name-input" type="text" name="name" required maxLength={50} value={formData.name} onChange={handleInputChange} placeholder="e.g. Panadol Extra" className={`w-full border rounded-xl py-2 px-3 text-xs focus:outline-none ${lightMode ? "bg-slate-50 border-slate-200 text-slate-800 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-200 focus:border-emerald-500"}`} />
             </div>
 
             <div className="space-y-1">
               <label className="text-[10px] font-bold uppercase text-slate-400">Generic Formula</label>
-              <input type="text" name="generic" maxLength={50} value={formData.generic} onChange={handleInputChange} placeholder="e.g. Paracetamol" className={`w-full border rounded-xl py-2 px-3 text-xs focus:outline-none ${lightMode ? "bg-slate-50 border-slate-200 text-slate-800 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-200 focus:border-emerald-500"}`} />
+              <input ref={genericInputRef} type="text" name="generic" maxLength={50} value={formData.generic} onChange={handleInputChange} placeholder="e.g. Paracetamol" className={`w-full border rounded-xl py-2 px-3 text-xs focus:outline-none ${lightMode ? "bg-slate-50 border-slate-200 text-slate-800 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-200 focus:border-emerald-500"}`} />
             </div>
 
             <div className="grid grid-cols-2 gap-3">
@@ -559,8 +699,17 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
                 <input type="text" name="batch" required maxLength={20} value={formData.batch} onChange={handleInputChange} placeholder="Enter batch" className={`w-full border rounded-xl py-2 px-3 text-xs uppercase focus:outline-none ${lightMode ? "bg-slate-50 border-slate-200 text-slate-800 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-200 focus:border-emerald-500"}`} />
               </div>
               <div className="space-y-1">
-                <label className="text-[10px] font-bold uppercase text-slate-400">Expiry Date</label>
-                <input type="month" name="expiry" value={formData.expiry} onChange={handleInputChange} min={minExpiryDateString} className={`w-full border rounded-xl py-2 px-3 text-xs focus:outline-none ${lightMode ? "bg-slate-50 border-slate-200 text-slate-800 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-200 focus:border-emerald-500"}`} />
+                <label className="text-[10px] font-bold uppercase text-slate-400">Expiry Date (MM / YYYY)</label>
+                {/* Two plain controlled inputs instead of the native
+                    type="month" widget — the browser's segmented month/year
+                    picker was clearing the whole field if you typed slower
+                    than it expected. Validation against the minimum date
+                    now happens on submit (see handleSubmit), not per
+                    keystroke, so partial input is never force-cleared. */}
+                <div className="flex gap-2">
+                  <input type="text" inputMode="numeric" name="expiryMonth" maxLength={2} placeholder="MM" value={expiryMonth} onChange={handleExpiryMonthChange} className={`w-1/2 border rounded-xl py-2 px-3 text-xs text-center focus:outline-none ${lightMode ? "bg-slate-50 border-slate-200 text-slate-800 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-200 focus:border-emerald-500"}`} />
+                  <input type="text" inputMode="numeric" name="expiryYear" maxLength={4} placeholder="YYYY" value={expiryYear} onChange={handleExpiryYearChange} className={`w-1/2 border rounded-xl py-2 px-3 text-xs text-center focus:outline-none ${lightMode ? "bg-slate-50 border-slate-200 text-slate-800 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-200 focus:border-emerald-500"}`} />
+                </div>
               </div>
             </div>
 
@@ -569,15 +718,40 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
                 <label className="text-[10px] font-bold uppercase text-slate-400">Boxes</label>
                 <input type="number" name="boxes" min="0" value={formData.boxes} onChange={handleInputChange} placeholder="0" className={`w-full border rounded-xl py-2 px-3 text-xs focus:outline-none ${lightMode ? "bg-slate-50 border-slate-200 text-slate-800 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-200 focus:border-emerald-500"}`} />
               </div>
-              <div className="space-y-1">
-                <label className="text-[10px] font-bold uppercase text-slate-400">Strips</label>
-                <input type="number" name="strips" min="0" value={formData.strips} onChange={handleInputChange} placeholder="0" className={`w-full border rounded-xl py-2 px-3 text-xs focus:outline-none ${lightMode ? "bg-slate-50 border-slate-200 text-slate-800 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-200 focus:border-emerald-500"}`} />
-              </div>
+              {isEditMode ? (
+                // Edit mode keeps "Strips" here — this is how existing stock
+                // gets corrected during an edit, unrelated to the tablets
+                // feature and unchanged from before.
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold uppercase text-slate-400">Strips</label>
+                  <input type="number" name="strips" min="0" value={formData.strips} onChange={handleInputChange} placeholder="0" className={`w-full border rounded-xl py-2 px-3 text-xs focus:outline-none ${lightMode ? "bg-slate-50 border-slate-200 text-slate-800 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-200 focus:border-emerald-500"}`} />
+                </div>
+              ) : (
+                // Add New Product mode: the rarely-used loose-Strips entry is
+                // replaced with Tablets/Strip — a product attribute (how many
+                // tablets make up one strip), not an initial-stock quantity.
+                // Leave blank for products that aren't sold by the tablet.
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold uppercase text-slate-400">Tablets / Strip</label>
+                  <input type="number" name="tabletsPerStrip" min="0" value={formData.tabletsPerStrip} onChange={handleInputChange} placeholder="Optional" className={`w-full border rounded-xl py-2 px-3 text-xs focus:outline-none ${lightMode ? "bg-slate-50 border-slate-200 text-slate-800 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-200 focus:border-emerald-500"}`} />
+                </div>
+              )}
               <div className="space-y-1">
                 <label className="text-[10px] font-bold uppercase text-slate-400">Pack/Factor</label>
                 <input type="number" name="factor" min="1" value={formData.factor} onChange={handleInputChange} placeholder="2" className={`w-full border rounded-xl py-2 px-3 text-xs focus:outline-none ${lightMode ? "bg-slate-50 border-slate-200 text-slate-800 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-200 focus:border-emerald-500"}`} />
               </div>
             </div>
+
+            {isEditMode && (
+              // Editing an existing product can still set/change Tablets/Strip
+              // here — this is the one place it's available in Edit mode,
+              // since a product added before this feature existed may want
+              // it turned on later.
+              <div className="space-y-1">
+                <label className="text-[10px] font-bold uppercase text-slate-400">Tablets / Strip <span className="normal-case font-medium text-slate-400">(leave blank if not sold by the tablet)</span></label>
+                <input type="number" name="tabletsPerStrip" min="0" value={formData.tabletsPerStrip} onChange={handleInputChange} placeholder="Optional" className={`w-full border rounded-xl py-2 px-3 text-xs focus:outline-none ${lightMode ? "bg-slate-50 border-slate-200 text-slate-800 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-200 focus:border-emerald-500"}`} />
+              </div>
+            )}
 
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1">
@@ -596,7 +770,7 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
             {isEditMode ? (
               <button type="button" onClick={handleCancelEdit} className={`font-bold py-3 rounded-xl text-xs uppercase transition-colors border ${lightMode ? "bg-slate-100 border-slate-200 text-slate-600 hover:bg-slate-200" : "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"}`}>Cancel</button>
             ) : (
-              <button type="button" onClick={() => setFormData({ barcode: "", name: "", generic: "", batch: "", expiry: "", boxes: "", strips: "", factor: 2, buyingPrice: "", retailPrice: "" })} className={`font-bold py-3 rounded-xl text-xs uppercase transition-colors border ${lightMode ? "bg-slate-100 border-slate-200 text-slate-600 hover:bg-slate-200" : "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"}`}>Clear Form</button>
+              <button type="button" onClick={() => setFormData({ barcode: "", name: "", generic: "", batch: "", expiry: "", boxes: "", strips: "", factor: 2, buyingPrice: "", retailPrice: "", tabletsPerStrip: "" })} className={`font-bold py-3 rounded-xl text-xs uppercase transition-colors border ${lightMode ? "bg-slate-100 border-slate-200 text-slate-600 hover:bg-slate-200" : "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"}`}>Clear Form</button>
             )}
             <button type="submit" disabled={isSavingStock} className={`font-black py-3 rounded-xl text-xs uppercase shadow-md transition-all disabled:opacity-50 disabled:pointer-events-none ${isEditMode ? "bg-gradient-to-r from-amber-400 to-orange-400 text-slate-900" : "bg-gradient-to-r from-emerald-500 to-teal-500 text-white"}`}>
               {isSavingStock ? "Saving..." : isEditMode ? "Save Edits" : "Log Stock"}
@@ -615,6 +789,7 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
               <option value="all">Total Stock</option>
               <option value="expiryAlert">Expiry Warnings</option>
               <option value="low">Low Stock Alerts</option>
+              <option value="outOfStock">Out of Stock</option>
             </select>
           </div>
           <div className="relative w-full sm:w-64">
@@ -633,12 +808,12 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
             <table className="w-full text-left border-separate border-spacing-0 text-xs">
               <thead className={`sticky top-0 z-10 border-b text-[10px] font-black uppercase tracking-widest text-slate-400 select-none ${lightMode ? "bg-slate-50 border-slate-200 shadow-sm" : "bg-slate-950 border-slate-800"}`}>
                 <tr>
-                  <th className="py-4 px-6 border-b border-slate-800/20">Product ID & Profile</th>
-                  <th className="py-4 px-4 border-b border-slate-800/20">Batch & Expiry</th>
-                  <th className="py-4 px-4 border-b border-slate-800/20">Stock Balance</th>
-                  <th className="py-4 px-5 border-b border-slate-800/20">Intake Time</th>
-                  <th className="py-4 px-4 border-b border-slate-800/20">Buy Price</th>
-                  <th className="py-4 px-4 border-b border-slate-800/20">Retail Price</th>
+                  <th className="py-4 px-6 border-b border-slate-800/20 cursor-pointer select-none" onClick={() => handleSortClick("name")}>Product ID & Profile{sortIndicator("name")}</th>
+                  <th className="py-4 px-4 border-b border-slate-800/20 cursor-pointer select-none" onClick={() => handleSortClick("batch")}>Batch & Expiry{sortIndicator("batch")}</th>
+                  <th className="py-4 px-4 border-b border-slate-800/20 cursor-pointer select-none" onClick={() => handleSortClick("totalUnits")}>Stock Balance{sortIndicator("totalUnits")}</th>
+                  <th className="py-4 px-5 border-b border-slate-800/20 cursor-pointer select-none" onClick={() => handleSortClick("intake_time")}>Intake Time{sortIndicator("intake_time")}</th>
+                  <th className="py-4 px-4 border-b border-slate-800/20 cursor-pointer select-none" onClick={() => handleSortClick("buyingPrice")}>Buy Price{sortIndicator("buyingPrice")}</th>
+                  <th className="py-4 px-4 border-b border-slate-800/20 cursor-pointer select-none" onClick={() => handleSortClick("retailPrice")}>Retail Price{sortIndicator("retailPrice")}</th>
                   <th className="py-4 px-5 border-b border-slate-800/20 text-center">Actions</th>
                 </tr>
               </thead>
@@ -648,6 +823,7 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
                   const strips = med.totalUnits % med.factor;
                   const isExpiring = isExpiringWithinCustomThreshold(med.expiry);
                   const isLow = med.totalUnits <= (med.factor * 2);
+                  const isOutOfStock = med.totalUnits === 0;
 
                   let readableIntakeTime = "N/A";
                   if (med.intake_time) {
@@ -664,6 +840,8 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
                   let dynamicRowClass = lightMode ? "hover:bg-slate-50" : "hover:bg-slate-800/30";
                   if (isExpiring) {
                     dynamicRowClass = lightMode ? "bg-rose-50/50 hover:bg-rose-100/50" : "bg-rose-950/20 hover:bg-rose-900/30";
+                  } else if (isOutOfStock) {
+                    dynamicRowClass = lightMode ? "bg-blue-50/50 hover:bg-blue-100/50" : "bg-blue-950/20 hover:bg-blue-900/30";
                   } else if (isLow) {
                     dynamicRowClass = lightMode ? "bg-amber-50/50 hover:bg-amber-100/50" : "bg-amber-950/20 hover:bg-amber-900/30";
                   }
@@ -683,18 +861,22 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
                       <td className="py-4 px-4">
                         <div className="flex items-center gap-1.5">
                           <div className={`flex items-baseline gap-1 px-2 py-0.5 rounded-lg border ${
-                            isLow 
-                              ? (lightMode ? "bg-amber-100 border-amber-200 text-amber-700" : "bg-amber-500/10 border-amber-500/20 text-amber-400") 
-                              : (lightMode ? "bg-white border-slate-200 text-slate-700" : "bg-slate-950 border-slate-800 text-slate-300")
+                            isOutOfStock
+                              ? (lightMode ? "bg-blue-100 border-blue-200 text-blue-700" : "bg-blue-500/10 border-blue-500/20 text-blue-400")
+                              : isLow
+                                ? (lightMode ? "bg-amber-100 border-amber-200 text-amber-700" : "bg-amber-500/10 border-amber-500/20 text-amber-400")
+                                : (lightMode ? "bg-white border-slate-200 text-slate-700" : "bg-slate-950 border-slate-800 text-slate-300")
                           }`}>
                             <span className="font-black text-sm">{boxes}</span>
                             <span className="text-[9px] uppercase font-bold tracking-wider opacity-70">Box</span>
                           </div>
                           <span className="text-slate-400 font-bold text-xs">+</span>
                           <div className={`flex items-baseline gap-1 px-2 py-0.5 rounded-lg border ${
-                            isLow 
-                              ? (lightMode ? "bg-amber-100 border-amber-200 text-amber-700" : "bg-amber-500/10 border-amber-500/20 text-amber-400") 
-                              : (lightMode ? "bg-white border-slate-200 text-slate-700" : "bg-slate-950 border-slate-800 text-slate-300")
+                            isOutOfStock
+                              ? (lightMode ? "bg-blue-100 border-blue-200 text-blue-700" : "bg-blue-500/10 border-blue-500/20 text-blue-400")
+                              : isLow
+                                ? (lightMode ? "bg-amber-100 border-amber-200 text-amber-700" : "bg-amber-500/10 border-amber-500/20 text-amber-400")
+                                : (lightMode ? "bg-white border-slate-200 text-slate-700" : "bg-slate-950 border-slate-800 text-slate-300")
                           }`}>
                             <span className="font-black text-sm">{strips}</span>
                             <span className="text-[9px] uppercase font-bold tracking-wider opacity-70">Str</span>
@@ -733,9 +915,9 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
           <div className="flex items-center gap-2 text-slate-400">
             <span>Rows per page:</span>
             <select value={rowsPerPage} onChange={(e) => { setRowsPerPage(parseInt(e.target.value)); setCurrentPage(1); }} className={`py-1 px-2 border rounded-lg focus:outline-none font-bold ${lightMode ? "bg-white border-slate-200 text-slate-700" : "bg-slate-900 border-slate-800 text-slate-300"}`}>
-              <option value={10}>10</option>
-              <option value={20}>20</option>
               <option value={50}>50</option>
+              <option value={100}>100</option>
+              <option value={200}>200</option>
             </select>
           </div>
           <div className="text-slate-400 font-mono">

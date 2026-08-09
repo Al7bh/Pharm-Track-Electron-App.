@@ -1070,9 +1070,14 @@ ipcMain.handle('testServerConnection', async (event, { serverIp, serverPort, api
       headers: apiToken ? { 'x-api-token': apiToken } : {}
     };
     const req = http.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => data += chunk);
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => {
+        // Concatenate as Buffers first, THEN decode once — decoding each
+        // chunk independently (e.g. `data += chunk`) corrupts any
+        // multi-byte UTF-8 character that happens to straddle a chunk
+        // boundary (common in drug names: µg, °, etc.).
+        const data = Buffer.concat(chunks).toString('utf8');
         if (res.statusCode === 401) {
           return resolve({ success: false, message: 'Server reached, but the security token does not match the server\'s.' });
         }
@@ -1260,9 +1265,13 @@ ipcMain.handle('checkServerStatus', async () => {
     };
     if (sysConfig.apiToken) options.headers['x-api-token'] = sysConfig.apiToken;
     const req = http.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => data += chunk);
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => {
+        // See networkCall() for why chunks are concatenated as Buffers
+        // before decoding, instead of decoding (and appending) each one
+        // independently.
+        const data = Buffer.concat(chunks).toString('utf8');
         try { resolve(JSON.parse(data)); }
         catch { resolve({ status: 'offline' }); }
       });
@@ -1918,9 +1927,18 @@ function networkCall(method, endpoint, body, config) {
     if (bodyStr) options.headers['Content-Length'] = Buffer.byteLength(bodyStr);
 
     const req = http.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => data += chunk);
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => {
+        // Concatenate as Buffers first, THEN decode once. Decoding each
+        // chunk independently (the old `data += chunk`, which implicitly
+        // calls chunk.toString('utf8') per chunk) corrupts any multi-byte
+        // UTF-8 character that lands across a chunk boundary — silently
+        // garbling product names/generics without ever throwing, so it's
+        // easy to miss. Only matters once a response is large enough to
+        // arrive in more than one TCP chunk, e.g. the full inventory list
+        // on a large catalog.
+        const data = Buffer.concat(chunks).toString('utf8');
         let parsed = null;
         try { parsed = JSON.parse(data); } catch (e) { /* handled below */ }
 

@@ -1,108 +1,12 @@
 import React, { useState, useEffect, useRef } from "react";
 import SalesCounter from "./components/SalesCounter";
 import StockManagement from "./components/StockManagement";
+import RestockScreen from "./components/RestockScreen";
 import SalesHistory from "./components/SalesHistory";
 import OwnerEarnings from "./components/OwnerEarnings";
 import receiptLogo from "./assets/receipt-logo.png";
-// =========================================================================
-// ENTERPRISE GS1 BARCODE PARSER ENGINE
-// =========================================================================
-// GS1-128 barcodes terminate variable-length fields (batch/lot = AI 10,
-// serial = AI 21, count = AI 30, additional product data = AI 240) with an
-// FNC1 control character, transmitted by most scanners as ASCII 0x1D
-// (Group Separator). That character is the ONLY unambiguous way to know
-// where a variable-length field ends — digit-pattern guessing is a
-// fallback for scanners/barcodes that don't send it, and can misfire if
-// the field's own content happens to contain a sequence that looks like
-// the start of another Application Identifier (this is what was truncating
-// batch codes and letting price text leak into the name field).
-const GS = "\x1D";
+import { parsePharmacyBarcode } from "./utils/gs1Parser";
 
-const parsePharmacyBarcode = (scan) => {
-  let parsed = {
-    raw: scan,
-    gtin: scan,
-    batch: "",
-    expiry: "",
-    name: "",
-    retailPrice: "",
-  };
-
-  if (!scan.startsWith("01") || scan.length < 16) return parsed;
-
-  parsed.gtin = scan.slice(2, 16);
-  let remaining = scan.slice(16);
-  // Fixed-length AIs (e.g. GTIN, expiry) are sometimes still followed by a
-  // defensive separator from the encoder even though the spec doesn't
-  // require one — strip a leading one if present so it doesn't get
-  // mistaken for the start of the next field's content.
-  if (remaining.startsWith(GS)) remaining = remaining.slice(1);
-
-  // Finds where the CURRENT variable-length field ends within `str`.
-  const findFieldEnd = (str) => {
-    // Preferred: the true GS1 separator, if the scanner transmitted it.
-    // Authoritative — can't be fooled by digits inside the field.
-    const gsIdx = str.indexOf(GS);
-    if (gsIdx !== -1) return { end: gsIdx, matchedSeparator: true };
-
-    // Fallback: best-effort guess based on the next recognizable AI
-    // pattern. Only used when no real separator is present.
-    let boundaryIdx = str.length;
-    const match17 = str.match(/17\d{6}/);
-    if (match17 && match17.index < boundaryIdx) boundaryIdx = match17.index;
-
-    const match240 = str.match(/240/);
-    if (match240 && match240.index < boundaryIdx) boundaryIdx = match240.index;
-
-    const match21 = str.match(/21[A-Za-z0-9]{3,}/);
-    if (match21 && match21.index < boundaryIdx) boundaryIdx = match21.index;
-
-    const match30 = str.match(/30\d{1,8}/);
-    if (match30 && match30.index < boundaryIdx) boundaryIdx = match30.index;
-
-    return { end: boundaryIdx, matchedSeparator: false };
-  };
-
-  // Consumes a leading separator, if any, after a field has been sliced off.
-  const consumeSeparator = (str) => (str.startsWith(GS) ? str.slice(1) : str);
-
-  while (remaining.length > 0) {
-    if (remaining.startsWith("17") && remaining.length >= 8) {
-      const rawExp = remaining.slice(2, 8);
-      if (/^\d{6}$/.test(rawExp)) {
-        parsed.expiry = `20${rawExp.slice(0, 2)}-${rawExp.slice(2, 4)}-${rawExp.slice(4, 6)}`;
-        remaining = consumeSeparator(remaining.slice(8));
-        continue;
-      }
-    }
-
-    if (remaining.startsWith("10")) {
-      remaining = remaining.slice(2);
-      const { end } = findFieldEnd(remaining);
-      parsed.batch = remaining.slice(0, end);
-      remaining = consumeSeparator(remaining.slice(end));
-    } else if (remaining.startsWith("21") || remaining.startsWith("30")) {
-      remaining = remaining.slice(2);
-      const { end } = findFieldEnd(remaining);
-      remaining = consumeSeparator(remaining.slice(end));
-    } else if (remaining.startsWith("240")) {
-      remaining = remaining.slice(3);
-      const { end } = findFieldEnd(remaining);
-      const extraText = remaining.slice(0, end);
-      const rsMatch = extraText.match(/(.*?)Rs\.?(\d+(\.\d+)?)/i);
-      if (rsMatch) {
-        parsed.name = rsMatch[1].trim();
-        parsed.retailPrice = rsMatch[2];
-      } else {
-        parsed.name = extraText.trim();
-      }
-      remaining = consumeSeparator(remaining.slice(end));
-    } else {
-      break;
-    }
-  }
-  return parsed;
-};
 
 function App() {
   const [currentTab, setCurrentTab] = useState("sales");
@@ -180,6 +84,7 @@ function App() {
   const [earningPinInput, setEarningPinInput] = useState("");
 
   const [scannedInventoryData, setScannedInventoryData] = useState(null);
+  const [scannedRestockData, setScannedRestockData] = useState(null);
   const [scannedInvoiceId, setScannedInvoiceId] = useState(null);
 
   const [pendingCollisions, setPendingCollisions] = useState([]);
@@ -363,13 +268,38 @@ function App() {
   // =========================================================================
   // GAP-BASED HARDWARE SCAN DETECTOR
   // =========================================================================
+  // scanLiveRef always holds the latest values/functions this handler needs.
+  // Updated every render (cheap — just an object assignment, no listener
+  // churn), so the actual DOM listener below can stay attached for the
+  // component's whole lifetime without ever going stale.
+  const scanLiveRef = useRef({});
+  useEffect(() => {
+    scanLiveRef.current = {
+      isAuthenticated,
+      currentTab,
+      setCurrentTab,
+      setScannedInvoiceId,
+      setSearchQuery,
+      handleMagicScanSale,
+      loadProductToCounter,
+      setIsCartOpen,
+      setPendingCollisions,
+      handleSearchChange,
+      showNotification,
+      setScannedInventoryData,
+      setScannedRestockData,
+    };
+  });
+
   useEffect(() => {
     let scanBuffer = "";
     let lastKeyTime = 0;
 
     const handleGlobalBarcodeScan = async (e) => {
+      const live = scanLiveRef.current;
+
       // CRITICAL SECURITY GUARD: Block hardware input parsing until terminal is authorized
-      if (!isAuthenticated) return; 
+      if (!live.isAuthenticated) return; 
 
       const now = Date.now();
       const gap = now - lastKeyTime;
@@ -398,23 +328,29 @@ function App() {
           // what caused truncated batch codes and price text leaking into
           // the name field.
           let currentScanData = scanBuffer
-            .replace(/[\x00-\x1C\x1E\x1F\x7F]/g, "")
+            .replace(/[\x00-\x1C\x1E\x1F\x7F]/g, (char) => (char === "\x1D" ? "\x1D" : ""))
             .trim();
           scanBuffer = "";
 
           currentScanData = currentScanData.replace(/\*/g, "");
+          if (currentScanData) {
+            const startMatch = currentScanData.match(/01\d{14}/);
+            if (startMatch && startMatch.index !== undefined && startMatch.index > 0) {
+              currentScanData = currentScanData.slice(startMatch.index);
+            }
+          }
 
           if (/^(INV-|sale-)\d+$/i.test(currentScanData)) {
             const cleanId = currentScanData.replace(/^(INV-|sale-)/i, "");
-            setCurrentTab("history");
-            setScannedInvoiceId(`sale-${cleanId}`);
+            live.setCurrentTab("history");
+            live.setScannedInvoiceId(`sale-${cleanId}`);
             return;
           }
 
           const parsedData = parsePharmacyBarcode(currentScanData);
 
-          if (currentTab === "sales") {
-            setSearchQuery("");
+          if (live.currentTab === "sales") {
+            live.setSearchQuery("");
             if (window.electronAPI && window.electronAPI.getProductsByBarcode) {
               const dbProducts = await window.electronAPI.getProductsByBarcode(
                 parsedData.gtin,
@@ -424,28 +360,30 @@ function App() {
                 dbProducts &&
                 dbProducts.length === 1
               ) {
-                handleMagicScanSale(dbProducts[0]);
-                loadProductToCounter(dbProducts[0]);
-                setIsCartOpen(true);
+                live.handleMagicScanSale(dbProducts[0]);
+                live.loadProductToCounter(dbProducts[0]);
+                live.setIsCartOpen(true);
               } else if (dbProducts && dbProducts.length > 0) {
-                setPendingCollisions(dbProducts);
+                live.setPendingCollisions(dbProducts);
               } else {
                 const searchInput = document.querySelector(
                   'input[placeholder*="Search formulations..."]',
                 );
                 if (searchInput) {
                   searchInput.focus();
-                  handleSearchChange({ target: { value: parsedData.gtin } });
+                  live.handleSearchChange({ target: { value: parsedData.gtin } });
                 }
-                showNotification(
+                live.showNotification(
                   "Item Not Found",
                   "This barcode is not in our system. Please register the item first.",
                   "warning",
                 );
               }
             }
-          } else if (currentTab === "inventory") {
-            setScannedInventoryData(parsedData);
+          } else if (live.currentTab === "inventory") {
+            live.setScannedInventoryData(parsedData);
+          } else if (live.currentTab === "restock") {
+            live.setScannedRestockData(parsedData);
           }
         }
       }
@@ -453,7 +391,7 @@ function App() {
 
     window.addEventListener("keydown", handleGlobalBarcodeScan);
     return () => window.removeEventListener("keydown", handleGlobalBarcodeScan);
-  }, [salesHistory, currentTab, cart, inventory]);
+  }, []);
 
   // Handle click outside search box to hide dropdown list
   useEffect(() => {
@@ -526,12 +464,28 @@ function App() {
   const inventorySeqRef = useRef(0);
   const salesSeqRef = useRef(0);
 
+  // In-flight guards: the 5s poll used to fire unconditionally even if the
+  // previous request hadn't landed yet. That was harmless on a small table,
+  // but once /api/inventory (no LIMIT — it fetches the whole table every
+  // time) started taking longer than 5s to complete on a large inventory
+  // over the network, EVERY poll cycle began before the last one finished.
+  // Each new request bumped inventorySeqRef, so by the time any given
+  // request resolved it was already "stale" per the check below and got
+  // thrown away — forever. Net effect: setInventory() never ran again and
+  // Stock Management stayed permanently empty, even though the server was
+  // online and answering fine. Skipping a poll cycle while one is already
+  // in flight (instead of racing a new one against it) fixes that.
+  const inventoryFetchInFlightRef = useRef(false);
+  const salesFetchInFlightRef = useRef(false);
+
   // `silent` is used by the background poll: a failing poll must never raise a
   // modal. It used to throw a blocking, full-screen error every 5 seconds
   // (twice — once per refresher), which bricked the app whenever the server
   // PC slept. The nav status indicator is the right place to show this.
   const refreshStockLedger = ({ silent = false } = {}) => {
     if (!window.electronAPI || !window.electronAPI.getInventory) return;
+    if (inventoryFetchInFlightRef.current) return; // previous fetch still running — let it finish instead of orphaning it
+    inventoryFetchInFlightRef.current = true;
     const seq = ++inventorySeqRef.current;
     window.electronAPI.getInventory()
       .then((data) => {
@@ -544,11 +498,14 @@ function App() {
         console.error("Inventory refresh failed:", err);
         setServerStatus("offline");
 if (!silent) showNotification("Connection Issue", friendlyErrorMessage(err, "Could not load the stock list. Please check the main computer."), "error");
-      });
+      })
+      .finally(() => { inventoryFetchInFlightRef.current = false; });
   };
 
   const refreshSalesHistory = ({ silent = false } = {}) => {
     if (!window.electronAPI || !window.electronAPI.getSalesHistory) return;
+    if (salesFetchInFlightRef.current) return; // previous fetch still running — let it finish instead of orphaning it
+    salesFetchInFlightRef.current = true;
     const seq = ++salesSeqRef.current;
     window.electronAPI.getSalesHistory()
       .then((data) => {
@@ -561,7 +518,8 @@ if (!silent) showNotification("Connection Issue", friendlyErrorMessage(err, "Cou
         console.error("Sales history refresh failed:", err);
         setServerStatus("offline");
 if (!silent) showNotification("Connection Issue", friendlyErrorMessage(err, "Could not load the sales history. Please check the main computer."), "error");
-      });
+      })
+      .finally(() => { salesFetchInFlightRef.current = false; });
   };
 
   // Deletes a return transcript outright (no inventory reversal — see
@@ -723,19 +681,41 @@ if (!silent) showNotification("Connection Issue", friendlyErrorMessage(err, "Cou
   const handleDismissProduct = (productId) =>
     setActiveProducts((prev) => prev.filter((p) => p.id !== productId));
 
-  const handleSearchChange = async (e) => {
+  // Debounced + sequence-guarded: every keystroke used to fire its own
+  // full-table LIKE '%...%' query immediately (no index can serve a leading
+  // wildcard, so each one is a full scan). That was fine on a small table,
+  // but on a large inventory a fast burst of characters — typed manually, or
+  // injected by a scanner app into this same focused input — queued up a
+  // stack of slow, unindexed queries on the single DB connection, and the
+  // search box looked frozen until the backlog drained. Waiting for a short
+  // pause in typing before querying collapses a whole burst into one query.
+  // The sequence guard also stops a slow early response from clobbering a
+  // faster later one and showing stale results.
+  const searchDebounceRef = useRef(null);
+  const searchSeqRef = useRef(0);
+
+  const handleSearchChange = (e) => {
     const val = e.target.value;
     setSearchQuery(val);
-    if (
-      val.trim().length > 0 &&
-      window.electronAPI &&
-      window.electronAPI.searchInventory
-    ) {
-      const results = await window.electronAPI.searchInventory(val);
-      setSearchResults(results);
-    } else {
+
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+
+    if (!(val.trim().length > 0 && window.electronAPI && window.electronAPI.searchInventory)) {
       setSearchResults([]);
+      return;
     }
+
+    const seq = ++searchSeqRef.current;
+    searchDebounceRef.current = setTimeout(async () => {
+      try {
+        const results = await window.electronAPI.searchInventory(val);
+        if (seq !== searchSeqRef.current) return; // a newer search already superseded this one
+        setSearchResults(results);
+      } catch (err) {
+        if (seq !== searchSeqRef.current) return;
+        console.error("Product search failed:", err);
+      }
+    }, 250);
   };
 
   // Returns true only when the write actually succeeded, so the form knows
@@ -1611,7 +1591,7 @@ showNotification("Error", "Could not verify your PIN. Please try again.", "error
         </div>
 
         {/* CENTER SEARCH */}
-        <div ref={searchContainerRef} className="flex-1 max-w-2xl mx-6 relative">
+        <div ref={searchContainerRef} className="flex-1 min-w-0 max-w-2xl mx-3 lg:mx-6 relative">
           <div className="relative group">
             <span className="material-symbols-outlined absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 text-lg">
               search
@@ -1626,7 +1606,7 @@ showNotification("Error", "Could not verify your PIN. Please try again.", "error
           </div>
           {searchResults.length > 0 && (
             <div
-              className={`absolute top-14 left-0 w-full border rounded-xl shadow-2xl z-50 overflow-hidden divide-y ${lightMode ? "bg-white border-slate-200 divide-slate-100" : "bg-slate-900 border-slate-800 divide-slate-800/60"}`}
+              className={`absolute top-14 left-0 w-full border rounded-xl shadow-2xl z-50 overflow-y-auto max-h-[60vh] divide-y ${lightMode ? "bg-white border-slate-200 divide-slate-100" : "bg-slate-900 border-slate-800 divide-slate-800/60"}`}
             >
               {searchResults.map((prod, index) => (
   <div
@@ -1635,26 +1615,26 @@ showNotification("Error", "Could not verify your PIN. Please try again.", "error
                     loadProductToCounter(prod);
                     setCurrentTab("sales");
                   }}
-                  className={`p-4 cursor-pointer flex justify-between items-center transition-colors ${lightMode ? "hover:bg-slate-50" : "hover:bg-slate-800/50"}`}
+                  className={`p-4 cursor-pointer flex justify-between items-center gap-3 transition-colors ${lightMode ? "hover:bg-slate-50" : "hover:bg-slate-800/50"}`}
                 >
-                  <div>
+                  <div className="min-w-0">
                     <div
-                      className={`text-sm font-black ${lightMode ? "text-slate-800" : "text-slate-200"}`}
+                      className={`text-sm font-black truncate ${lightMode ? "text-slate-800" : "text-slate-200"}`}
                     >
                       {prod.name}
                     </div>
-                    <div className="text-xs text-slate-500 mt-1 flex items-center gap-2">
+                    <div className="text-xs text-slate-500 mt-1 flex items-center gap-2 min-w-0">
                       <span
-                        className={`font-mono px-1.5 py-0.5 rounded border ${lightMode ? "bg-slate-100 border-slate-200" : "bg-slate-950 border-slate-800"}`}
+                        className={`shrink-0 font-mono px-1.5 py-0.5 rounded border ${lightMode ? "bg-slate-100 border-slate-200" : "bg-slate-950 border-slate-800"}`}
                       >
                         Batch: {prod.batch}
                       </span>
-                      <span className="truncate max-w-[200px]">
+                      <span className="truncate">
                         {prod.generic}
                       </span>
                     </div>
                   </div>
-                  <span className="text-xs font-mono font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-3 py-1 rounded-xl">
+                  <span className="shrink-0 text-xs font-mono font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-3 py-1 rounded-xl">
                     Rs. {Math.round(prod.retailPrice)}
                   </span>
                 </div>
@@ -1664,16 +1644,19 @@ showNotification("Error", "Could not verify your PIN. Please try again.", "error
         </div>
 
         {/* RIGHT ACTION BUTTONS */}
-        <div className="flex items-center gap-2 md:gap-4">
+        <div className="flex items-center gap-2 md:gap-4 shrink-0">
           {/* NO-PRINT TOGGLE — default OFF (receipts print normally).
               When ON, checkout still records the sale exactly as usual;
-              only the print job is skipped. Session-only, resets on reload. */}
+              only the print job is skipped. Session-only, resets on reload.
+              Icon + toggle only (no text label) so it stays compact and
+              doesn't compete with the search bar for width at any screen
+              size — the tooltip still spells out the current state. */}
           {currentTab === "sales" && (
             <button
               type="button"
               onClick={() => setNoPrintMode((prev) => !prev)}
               title={noPrintMode ? "Receipt printing is OFF for checkouts" : "Receipt printing is ON (default)"}
-              className={`flex items-center gap-2 px-3 py-2 rounded-xl border text-xs font-bold transition-colors ${
+              className={`shrink-0 flex items-center gap-1.5 px-2.5 py-2 rounded-xl border text-xs font-bold transition-colors ${
                 noPrintMode
                   ? (lightMode ? "bg-amber-100 border-amber-300 text-amber-700" : "bg-amber-500/10 border-amber-500/30 text-amber-400")
                   : (lightMode ? "bg-slate-50 border-slate-200 text-slate-500" : "bg-slate-800 border-slate-700 text-slate-400")
@@ -1682,7 +1665,6 @@ showNotification("Error", "Could not verify your PIN. Please try again.", "error
               <span className="material-symbols-outlined text-[18px]">
                 {noPrintMode ? "print_disabled" : "print"}
               </span>
-              <span className="hidden md:inline uppercase tracking-wider">No Print</span>
               <span className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${noPrintMode ? "bg-amber-500" : lightMode ? "bg-slate-300" : "bg-slate-600"}`}>
                 <span className={`inline-block h-3 w-3 transform rounded-full bg-white shadow transition-transform ${noPrintMode ? "translate-x-3.5" : "translate-x-0.5"}`} />
               </span>
@@ -1798,6 +1780,11 @@ showNotification("Error", "Could not verify your PIN. Please try again.", "error
                 <button onClick={() => { setCurrentTab("inventory"); setIsEarningAuthenticated(false); setEarningPinInput(""); }} title={!isSidebarOpen ? "Stock Management" : ""} className={`w-full flex items-center ${isSidebarOpen ? "gap-3.5 px-4" : "justify-center px-0"} py-3.5 rounded-xl font-bold text-left text-xs transition-all relative ${currentTab === "inventory" ? "text-slate-950 bg-gradient-to-r from-emerald-400 to-teal-400 font-black shadow-md shadow-emerald-500/10" : lightMode ? "text-slate-600 hover:bg-slate-200/60" : "text-slate-400 hover:bg-slate-900/40"}`}>
                   <span className="material-symbols-outlined text-lg shrink-0">inventory_2</span>
                   {isSidebarOpen && <span className="truncate animate-in fade-in duration-300">Stock Management</span>}
+                </button>
+
+                <button onClick={() => { setCurrentTab("restock"); setIsEarningAuthenticated(false); setEarningPinInput(""); }} title={!isSidebarOpen ? "Restock" : ""} className={`w-full flex items-center ${isSidebarOpen ? "gap-3.5 px-4" : "justify-center px-0"} py-3.5 rounded-xl font-bold text-left text-xs transition-all relative ${currentTab === "restock" ? "text-slate-950 bg-gradient-to-r from-emerald-400 to-teal-400 font-black shadow-md shadow-emerald-500/10" : lightMode ? "text-slate-600 hover:bg-slate-200/60" : "text-slate-400 hover:bg-slate-900/40"}`}>
+                  <span className="material-symbols-outlined text-lg shrink-0">move_to_inbox</span>
+                  {isSidebarOpen && <span className="truncate animate-in fade-in duration-300">Restock</span>}
                 </button>
                 
                 <button onClick={() => { setCurrentTab("history"); setIsEarningAuthenticated(false); setEarningPinInput(""); }} title={!isSidebarOpen ? "Sales History" : ""} className={`w-full flex items-center ${isSidebarOpen ? "gap-3.5 px-4" : "justify-center px-0"} py-3.5 rounded-xl font-bold text-left text-xs transition-all relative ${currentTab === "history" ? "text-slate-950 bg-gradient-to-r from-emerald-400 to-teal-400 font-black shadow-lg shadow-emerald-500/10" : lightMode ? "text-slate-600 hover:bg-slate-200/60" : "text-slate-400 hover:bg-slate-900/40"}`}>
@@ -2157,18 +2144,6 @@ showNotification("Error", "Could not verify your PIN. Please try again.", "error
                 </div>
               </section>
             </div>
-          ) : currentTab === "inventory" ? (
-            <div className="flex-1 flex overflow-hidden w-full h-full bg-slate-950 min-h-0">
-              <StockManagement
-                inventory={inventory}
-                onAddNewStock={handleSaveStockToDB}
-                onQuickRestock={handleQuickRestock}
-                onDeleteStock={handleDeleteStockFromDB}
-                lightMode={lightMode}
-                scannedData={scannedInventoryData}
-                clearScannedData={() => setScannedInventoryData(null)}
-              />
-            </div>
           ) : currentTab === "history" ? (
             <div className="flex-1 flex overflow-hidden w-full h-full bg-slate-950 min-h-0">
               <SalesHistory
@@ -2183,7 +2158,7 @@ showNotification("Error", "Could not verify your PIN. Please try again.", "error
                 clearScannedInvoice={() => setScannedInvoiceId(null)}
               />
             </div>
-          ) : (
+          ) : currentTab === "earnings" ? (
             <div className="flex-1 flex overflow-hidden w-full h-full min-h-0">
               {!isEarningAuthenticated ? (
                 <div
@@ -2240,7 +2215,35 @@ showNotification("Error", "Could not verify your PIN. Please try again.", "error
                 />
               )}
             </div>
-          )}
+          ) : null}
+
+          {/* Always mounted (not part of the ternary above) so an in-progress
+              entry — a half-filled Add New Product form, or a Restock screen
+              mid-lookup — survives switching to another tab and back,
+              instead of being wiped by an unmount. Visibility is toggled
+              with CSS only. */}
+          <div className={currentTab === "inventory" ? "flex-1 flex overflow-hidden w-full h-full bg-slate-950 min-h-0" : "hidden"}>
+            <StockManagement
+              inventory={inventory}
+              onAddNewStock={handleSaveStockToDB}
+              onQuickRestock={handleQuickRestock}
+              onDeleteStock={handleDeleteStockFromDB}
+              lightMode={lightMode}
+              scannedData={scannedInventoryData}
+              clearScannedData={() => setScannedInventoryData(null)}
+              onGoToRestock={() => setCurrentTab("restock")}
+            />
+          </div>
+          <div className={currentTab === "restock" ? "flex-1 flex overflow-hidden w-full h-full bg-slate-950 min-h-0" : "hidden"}>
+            <RestockScreen
+              inventory={inventory}
+              onAddNewStock={handleSaveStockToDB}
+              onQuickRestock={handleQuickRestock}
+              lightMode={lightMode}
+              scannedData={scannedRestockData}
+              clearScannedData={() => setScannedRestockData(null)}
+            />
+          </div>
         </div>
       </div>
     </div>

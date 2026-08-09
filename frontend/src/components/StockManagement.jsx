@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
+import { ALL_CATEGORIES, categorizeProduct } from "../utils/categorize";
 
-function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteStock, lightMode, scannedData, clearScannedData }) {
+function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteStock, lightMode, scannedData, clearScannedData, onGoToRestock }) {
   const currentDate = new Date();
   const currentYear = currentDate.getFullYear();
   const currentMonth = String(currentDate.getMonth() + 1).padStart(2, "0");
@@ -44,6 +45,9 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
   const [rowsPerPage, setRowsPerPage] = useState(50);
   const [currentPage, setCurrentPage] = useState(1);
   const [stockSearchQuery, setStockSearchQuery] = useState("");
+  // null = "All categories". Categories are inferred from the product name
+  // (see utils/categorize.js) — nothing is stored in the database for this.
+  const [categoryFilter, setCategoryFilter] = useState(null);
   const [stockFilterMode, setStockFilterMode] = useState("all");
   const [sortColumn, setSortColumn] = useState(null);
   const [sortDirection, setSortDirection] = useState("asc");
@@ -70,6 +74,23 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
     message: "",
   });
 
+  // Shown whenever a barcode matches an EXISTING product but under a
+  // different batch than any already on file — instead of silently
+  // assuming "this must be a new batch" (which is what let a mis-scanned
+  // or manually-corrected batch code create a duplicate row), this makes
+  // the user explicitly choose. Triggered from both the scan interceptor
+  // and the manual Add form submit.
+  const [batchMismatchDialog, setBatchMismatchDialog] = useState({
+    isOpen: false,
+    barcode: "",
+    productName: "",
+    existingBatches: [], // [{ batch, expiry }]
+    // What to do if the user confirms "yes, this really is a new batch".
+    // For the scan path this fills the form; for manual submit it re-runs
+    // handleSubmit with the check bypassed.
+    onConfirmNewBatch: null,
+  });
+
   const ackButtonRef = useRef(null);
   const quickAddInputRef = useRef(null);
 
@@ -94,32 +115,35 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
             // We have this exact Batch already -> Quick Restock
             setQuickAddDialog({ isOpen: true, targetItem: exactMatch, addBoxes: "", addStrips: "" });
           } else {
-            // WE KNOW THE PRODUCT, BUT THIS IS A NEW BATCH!
-            // Auto-fill the form with existing product details to save typing
+            // Barcode matches, but no batch on file matches this scan. This
+            // used to silently assume "must be a new batch" and pre-fill the
+            // Add form — which is exactly how a mis-scanned or manually-
+            // corrected batch code created duplicate rows. Ask instead.
             const template = matchesByBarcode[0];
-            setFormData((prev) => {
-              // Double scan shield
-              if (prev.barcode === scannedData.gtin && prev.batch === scannedData.batch) return prev;
-
-              setTimeout(() => {
-                // Focus the boxes input instantly because Name & Price are already filled!
-                const boxesInput = document.getElementsByName("boxes")[0];
-                if (boxesInput) boxesInput.focus();
-              }, 10);
-
-              return {
-                ...prev,
-                barcode: scannedData.gtin,
-                batch: scannedData.batch,
-                expiry: scannedData.expiry || "",
-                name: template.name,
-                generic: template.generic,
-                factor: template.factor,
-                buyingPrice: template.buyingPrice,
-                retailPrice: template.retailPrice,
-                boxes: "",
-                strips: ""
-              };
+            setBatchMismatchDialog({
+              isOpen: true,
+              barcode: scannedData.gtin,
+              productName: template.name,
+              existingBatches: matchesByBarcode.map((it) => ({ batch: it.batch, expiry: it.expiry })),
+              onConfirmNewBatch: () => {
+                setFormData((prev) => ({
+                  ...prev,
+                  barcode: scannedData.gtin,
+                  batch: scannedData.batch,
+                  expiry: scannedData.expiry || "",
+                  name: template.name,
+                  generic: template.generic,
+                  factor: template.factor,
+                  buyingPrice: template.buyingPrice,
+                  retailPrice: template.retailPrice,
+                  boxes: "",
+                  strips: ""
+                }));
+                setTimeout(() => {
+                  const boxesInput = document.getElementsByName("boxes")[0];
+                  if (boxesInput) boxesInput.focus();
+                }, 10);
+              },
             });
           }
         } else {
@@ -204,6 +228,11 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
       if (quickAddDialog.isOpen && e.key === "Escape") {
         e.preventDefault();
         setQuickAddDialog({ isOpen: false, targetItem: null, addBoxes: "", addStrips: "" });
+      }
+
+      if (batchMismatchDialog.isOpen && e.key === "Escape") {
+        e.preventDefault();
+        setBatchMismatchDialog({ isOpen: false, barcode: "", productName: "", existingBatches: [], onConfirmNewBatch: null });
       }
     };
     window.addEventListener("keydown", handleStockDialogKeys);
@@ -314,7 +343,7 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
     if (unitsToAdd <= 0) {
 setValidationDialog({
         isOpen: true,
-        message: "Please enter how many boxes or strips you want to add.",
+        message: "Enter boxes or strips to add.",
       });
       return;
     }
@@ -370,13 +399,13 @@ setValidationDialog({
     });
   };
 
-  const handleSubmit = async (e) => {
+  const handleSubmit = async (e, bypassBatchMismatchCheck = false) => {
     e.preventDefault();
     if (isSavingStock) return;
     if (!formData.name || !formData.batch || !formData.retailPrice || !formData.buyingPrice) {
 setValidationDialog({
         isOpen: true,
-        message: "Please fill in Name, Batch, Buying Price, and Retail Price before saving.",
+        message: "Name, Batch, Buying Price, and Retail Price are required.",
       });
       return;
     }
@@ -384,7 +413,7 @@ setValidationDialog({
     if (formData.tabletsPerStrip && (parseInt(formData.tabletsPerStrip) <= 0 || !/^\d+$/.test(formData.tabletsPerStrip))) {
       setValidationDialog({
         isOpen: true,
-        message: "Tablets per strip should be a whole number greater than 0 (or left blank if this product isn't sold by the tablet).",
+        message: "Tablets per strip must be a whole number above 0, or left blank.",
       });
       return;
     }
@@ -395,7 +424,7 @@ setValidationDialog({
     if (retailPriceRounded < buyPriceRounded) {
 setValidationDialog({
         isOpen: true,
-        message: "The selling price cannot be lower than the buying price. Please check your numbers.",
+        message: "Retail price can't be lower than buying price.",
       });
       return;
     }
@@ -403,7 +432,7 @@ setValidationDialog({
     if ((expiryMonth || expiryYear) && !formData.expiry) {
       setValidationDialog({
         isOpen: true,
-        message: "The expiry date looks incomplete or invalid — please check the month (1-12) and a 4-digit year.",
+        message: "Enter a valid expiry: month (1-12) and 4-digit year.",
       });
       return;
     }
@@ -411,7 +440,7 @@ setValidationDialog({
     if (formData.expiry && formData.expiry < minExpiryDateString) {
       setValidationDialog({
         isOpen: true,
-        message: "This expiry date is in the past. Please double-check the month and year.",
+        message: "Expiry date is in the past.",
       });
       return;
     }
@@ -421,15 +450,28 @@ setValidationDialog({
     // Prevent the user from manually typing a barcode and batch that already exists!
     // ==============================================================
     if (!isEditMode && formData.barcode) {
-      const isDuplicate = inventory.some(item => 
-        item.barcode === formData.barcode.trim() && 
-        item.batch === formData.batch.trim().toUpperCase()
-      );
-      
-if (isDuplicate) {
+      const typedBatch = formData.batch.trim().toUpperCase();
+      const matchesByBarcode = inventory.filter(item => item.barcode === formData.barcode.trim());
+      const exactMatch = matchesByBarcode.find(item => item.batch === typedBatch);
+
+      if (exactMatch) {
         setValidationDialog({
           isOpen: true,
-          message: "This item (same barcode and batch) already exists. Use the Quick Restock option instead.",
+          message: "Already exists — use Restock instead.",
+        });
+        return;
+      }
+
+      // Barcode matches an existing product, but under a different batch —
+      // this is exactly the scenario that used to sail through silently and
+      // create a duplicate row. Ask, rather than assume.
+      if (!bypassBatchMismatchCheck && matchesByBarcode.length > 0) {
+        setBatchMismatchDialog({
+          isOpen: true,
+          barcode: formData.barcode.trim(),
+          productName: matchesByBarcode[0].name,
+          existingBatches: matchesByBarcode.map((it) => ({ batch: it.batch, expiry: it.expiry })),
+          onConfirmNewBatch: () => handleSubmit(e, true),
         });
         return;
       }
@@ -463,6 +505,14 @@ if (isDuplicate) {
     }
   };
 
+  // Per-category counts (active stock only) for the category rail badges.
+  const categoryCounts = {};
+  inventory.forEach((med) => {
+    if (med.is_active === 0) return;
+    const cat = categorizeProduct(med.name).id;
+    categoryCounts[cat] = (categoryCounts[cat] || 0) + 1;
+  });
+
   const filteredInventory = inventory.filter((med) => {
     if (stockFilterMode === "low" && med.totalUnits <= (med.factor * 2)) {
       // Keep low stock items
@@ -472,6 +522,7 @@ if (isDuplicate) {
     
     if (stockFilterMode === "expiryAlert" && !isExpiringWithinCustomThreshold(med.expiry)) return false;
     if (stockFilterMode === "outOfStock" && med.totalUnits !== 0) return false;
+    if (categoryFilter && categorizeProduct(med.name).id !== categoryFilter) return false;
 
     const query = stockSearchQuery.toLowerCase();
     return (
@@ -670,6 +721,67 @@ if (isDuplicate) {
         </div>
       )}
 
+      {batchMismatchDialog.isOpen && (
+        <div className="fixed inset-0 z-[160] flex items-center justify-center bg-slate-950/75 backdrop-blur-sm p-4">
+          <div className={`border p-5 sm:p-6 rounded-2xl max-w-md w-full shadow-2xl flex flex-col gap-4 max-h-[90vh] overflow-y-auto ${lightMode ? "bg-white border-slate-200" : "bg-slate-900 border-slate-800"}`}>
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 shrink-0 rounded-xl bg-sky-500/10 border border-sky-500/20 flex items-center justify-center text-sky-500">
+                <span className="material-symbols-outlined text-xl">help</span>
+              </div>
+              <div>
+                <h3 className={`text-sm font-black uppercase tracking-wider ${lightMode ? "text-slate-800" : "text-slate-200"}`}>Is This a New Batch?</h3>
+                <p className="text-xs text-slate-400 font-medium mt-0.5">Barcode already on file</p>
+              </div>
+            </div>
+
+            <p className={`text-xs font-medium leading-relaxed ${lightMode ? "text-slate-600" : "text-slate-400"}`}>
+              <span className="font-bold">{batchMismatchDialog.productName}</span> already exists under {batchMismatchDialog.existingBatches.length > 1 ? "these batches" : "this batch"}:
+            </p>
+
+            <div className={`rounded-xl border divide-y max-h-32 overflow-y-auto text-xs ${lightMode ? "border-slate-200 divide-slate-100" : "border-slate-800 divide-slate-800"}`}>
+              {batchMismatchDialog.existingBatches.map((b, idx) => (
+                <div key={idx} className="flex justify-between items-center px-3 py-2">
+                  <span className={`font-mono font-bold ${lightMode ? "text-slate-700" : "text-slate-300"}`}>{b.batch || "N/A"}</span>
+                  <span className="text-slate-400">Exp: {b.expiry || "N/A"}</span>
+                </div>
+              ))}
+            </div>
+
+            <p className={`text-xs font-medium leading-relaxed ${lightMode ? "text-slate-600" : "text-slate-400"}`}>
+              Restocking one of these? Use Restock. Otherwise, confirm this is a genuinely new batch.
+            </p>
+
+
+            <div className="flex flex-col sm:flex-row gap-2">
+              {onGoToRestock && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setBatchMismatchDialog({ isOpen: false, barcode: "", productName: "", existingBatches: [], onConfirmNewBatch: null });
+                    onGoToRestock();
+                  }}
+                  className="flex-1 bg-gradient-to-r from-emerald-400 to-teal-400 text-slate-950 font-black py-2.5 rounded-xl text-xs uppercase tracking-wider hover:opacity-95 transition-all"
+                >
+                  Go to Restock
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  const confirmFn = batchMismatchDialog.onConfirmNewBatch;
+                  setBatchMismatchDialog({ isOpen: false, barcode: "", productName: "", existingBatches: [], onConfirmNewBatch: null });
+                  if (confirmFn) confirmFn();
+                }}
+                className={`flex-1 font-black py-2.5 rounded-xl text-xs uppercase tracking-wider border transition-colors ${lightMode ? "bg-slate-100 border-slate-200 text-slate-600 hover:bg-slate-200" : "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"}`}
+              >
+                This Is a New Batch
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+
       {/* LEFT-HAND FORM WORKSPACE */}
       <div className="w-[360px] flex flex-col shrink-0 h-full">
         <form onSubmit={handleSubmit} className={`flex-1 border rounded-2xl p-5 flex flex-col justify-between shadow-sm overflow-hidden ${lightMode ? "bg-white border-slate-200" : "bg-slate-900/60 border-slate-800"}`}>
@@ -781,15 +893,21 @@ if (isDuplicate) {
 
       {/* RIGHT-HAND TABLE WORKSPACE */}
       <div className={`flex-1 flex flex-col overflow-hidden border rounded-2xl shadow-sm ${lightMode ? "bg-white border-slate-200" : "bg-slate-900/60 border-slate-800"}`}>
-        {/* HEADER WITH SEARCH AND FILTER DROPDOWN */}
+        {/* HEADER WITH SEARCH AND FILTER DROPDOWNS */}
         <div className={`p-4 border-b flex flex-col sm:flex-row gap-3 justify-between sm:items-center shrink-0 ${lightMode ? "bg-slate-50 border-slate-200" : "bg-slate-900/40 border-slate-800"}`}>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 flex-wrap">
             <h3 className="text-xs font-black uppercase tracking-widest text-slate-400">Warehouse Ledger</h3>
             <select value={stockFilterMode} onChange={(e) => { setStockFilterMode(e.target.value); setCurrentPage(1); }} className={`border rounded-lg py-1.5 px-3 text-xs font-bold focus:outline-none cursor-pointer ${lightMode ? "bg-white border-slate-200 text-slate-700 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-300 focus:border-emerald-500"}`}>
               <option value="all">Total Stock</option>
               <option value="expiryAlert">Expiry Warnings</option>
               <option value="low">Low Stock Alerts</option>
               <option value="outOfStock">Out of Stock</option>
+            </select>
+            <select value={categoryFilter || "all"} onChange={(e) => { setCategoryFilter(e.target.value === "all" ? null : e.target.value); setCurrentPage(1); }} className={`border rounded-lg py-1.5 px-3 text-xs font-bold focus:outline-none cursor-pointer ${lightMode ? "bg-white border-slate-200 text-slate-700 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-300 focus:border-emerald-500"}`}>
+              <option value="all">All Categories</option>
+              {ALL_CATEGORIES.filter((cat) => categoryCounts[cat.id]).map((cat) => (
+                <option key={cat.id} value={cat.id}>{cat.label} ({categoryCounts[cat.id]})</option>
+              ))}
             </select>
           </div>
           <div className="relative w-full sm:w-64">

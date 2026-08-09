@@ -1,6 +1,6 @@
 {
   "name": "noumanpharmacy",
-  "version": "v1.0.10",
+  "version": "v1.2.1",
   "description": "Nouman Pharmacy POS System",
   "main": "main.js",
   "type": "commonjs",
@@ -20,6 +20,7 @@
     "express": "^5.2.1",
     "node-thermal-printer": "^4.6.0",
     "sqlite3": "^6.0.1"
+    ,"@valentynb/gs1-parser": "^2.0.0"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.4",

@@ -411,7 +411,7 @@ if (onNotify) onNotify("Reprint Failed", (res && res.message) || "Could not repr
             <span className="material-symbols-outlined absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-500 text-base">search</span>
             <input
               type="text"
-              placeholder="Search Invoice Id..."
+              placeholder="Search Invoice ID or Product..."
               value={historyQuery}
               onChange={handleLiveHistorySearch}
               className={`w-full border rounded-xl py-2 pl-10 pr-4 text-xs focus:outline-none transition-all ${lightMode ? "bg-white border-slate-200 text-slate-900 focus:border-emerald-500" : "bg-slate-950 border-slate-800 text-slate-200 focus:border-emerald-500/60"}`}

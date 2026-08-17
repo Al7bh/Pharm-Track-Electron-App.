@@ -47,4 +47,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // ─── Server Status (used by the nav indicator on client machines) ──────────
   checkServerStatus: () => ipcRenderer.invoke('checkServerStatus'),
+
+  // ─── Quick Sale Window (Ctrl+N on the Sales screen) ─────────────────────
+  openQuickSaleWindow: () => ipcRenderer.invoke('openQuickSaleWindow'),
+  closeSelfWindow: () => ipcRenderer.invoke('closeSelfWindow'),
 });

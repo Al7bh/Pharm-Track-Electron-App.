@@ -143,6 +143,89 @@ if (IS_SERVER) {
 }
 
 // =================================================================
+// STEP 3.5: SALES HISTORY HELPERS — live product-name sync + product
+// search. Shared by both the Express routes (server mode) and the IPC
+// handlers (server/standalone mode) so there's exactly one place that
+// defines "how a sale record is looked up and displayed."
+// =================================================================
+
+// Patches each sale's stored itemsJson with the CURRENT product name/generic
+// /batch from inventory (matched by productId), so an edit in Stock
+// Management shows up on old receipts/history too. Deliberately touches
+// ONLY name, generic, and batch — price, qty, discounts, and every money
+// figure stay exactly as they were recorded at sale time. Fails open: if
+// the inventory lookup errors, the original rows are returned unchanged
+// rather than breaking the screen.
+function attachLiveProductNames(rows) {
+  return new Promise((resolve) => {
+    if (!db || !rows || rows.length === 0) return resolve(rows);
+    db.all(`SELECT id, name, generic, batch FROM inventory`, [], (err, invRows) => {
+      if (err || !invRows) return resolve(rows);
+      const liveById = new Map(invRows.map((r) => [r.id.toString(), { name: r.name, generic: r.generic, batch: r.batch }]));
+      const patched = rows.map((row) => {
+        let items;
+        try { items = JSON.parse(row.itemsJson); } catch (e) { return row; }
+        if (!Array.isArray(items)) return row;
+        let changed = false;
+        const newItems = items.map((item) => {
+          const pid = item.productId != null ? item.productId.toString() : null;
+          const live = pid && liveById.get(pid);
+          if (!live) return item;
+          const nextName = live.name || item.name;
+          const nextGeneric = live.generic || item.generic;
+          const nextBatch = live.batch || item.batch;
+          if (nextName !== item.name || nextGeneric !== item.generic || nextBatch !== item.batch) {
+            changed = true;
+            return { ...item, name: nextName, generic: nextGeneric, batch: nextBatch };
+          }
+          return item;
+        });
+        return changed ? { ...row, itemsJson: JSON.stringify(newItems) } : row;
+      });
+      resolve(patched);
+    });
+  });
+}
+
+// Looks up sale records matching `query` — by invoice id (as before), OR by
+// product name/generic. Product matching checks both the name stored at
+// sale time (LIKE on itemsJson) AND the CURRENT inventory name (so a sale
+// still turns up under its new name after a rename in Stock Management).
+function findSalesHistoryRows(query) {
+  return new Promise((resolve, reject) => {
+    if (!db) return resolve([]);
+    const trimmed = (query || '').trim();
+    if (!trimmed) {
+      return db.all(`SELECT * FROM sales_history ORDER BY timestamp DESC`, [], (err, rows) => {
+        if (err) reject(err); else resolve(rows);
+      });
+    }
+    const idQuery = trimmed.toLowerCase().replace(/^inv-/, '').replace(/^sale-/, '').replace(/^ret-/, '');
+    const textPattern = `%${trimmed.toLowerCase()}%`;
+
+    db.all(
+      `SELECT id FROM inventory WHERE LOWER(name) LIKE ? OR LOWER(generic) LIKE ?`,
+      [textPattern, textPattern],
+      (invErr, invRows) => {
+        const matchedIds = invErr || !invRows ? [] : invRows.map((r) => r.id.toString());
+        const idClauses = matchedIds.map(() => `LOWER(itemsJson) LIKE ?`).join(' OR ');
+        const idParams = matchedIds.map((id) => `%"productid":"${id}"%`);
+
+        const sql =
+          `SELECT * FROM sales_history WHERE LOWER(id) LIKE ? OR CAST(SUBSTR(id, 6) AS TEXT) = ? OR LOWER(itemsJson) LIKE ?` +
+          (idClauses ? ` OR ${idClauses}` : '') +
+          ` ORDER BY timestamp DESC`;
+        const params = [`%${idQuery}%`, idQuery, textPattern, ...idParams];
+
+        db.all(sql, params, (err, rows) => {
+          if (err) reject(err); else resolve(rows);
+        });
+      }
+    );
+  });
+}
+
+// =================================================================
 // STEP 4: EXPRESS API SERVER (SERVER MODE ONLY)
 // Every database operation is exposed as an HTTP endpoint.
 // Client machines call these instead of IPC.
@@ -287,27 +370,15 @@ if (IS_SERVER) {
   expressApp.get('/api/sales', (req, res) => {
     db.all(`SELECT * FROM sales_history ORDER BY timestamp DESC`, [], (err, rows) => {
       if (err) return res.status(500).json({ error: err.message });
-      res.json(rows);
+      attachLiveProductNames(rows).then((patched) => res.json(patched));
     });
   });
 
   expressApp.get('/api/sales/search', (req, res) => {
-    const query = (req.query.q || '').trim().toLowerCase()
-      .replace(/^inv-/, '').replace(/^sale-/, '').replace(/^ret-/, '');
-    if (!query) {
-      return db.all(`SELECT * FROM sales_history ORDER BY timestamp DESC`, [], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
-      });
-    }
-    db.all(
-      `SELECT * FROM sales_history WHERE LOWER(id) LIKE ? OR CAST(SUBSTR(id, 6) AS TEXT) = ? ORDER BY timestamp DESC`,
-      [`%${query}%`, query],
-      (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
-      }
-    );
+    findSalesHistoryRows(req.query.q)
+      .then((rows) => attachLiveProductNames(rows))
+      .then((patched) => res.json(patched))
+      .catch((err) => res.status(500).json({ error: err.message }));
   });
 
   // Checkout and return share ONE implementation with the IPC handlers
@@ -968,6 +1039,72 @@ function createWindow() {
   }
 }
 
+// =================================================================
+// QUICK SALE WINDOW (Ctrl+N from the Sales screen)
+// A small, second, independent window so a second person at the counter
+// can be checked out without disturbing whatever's on the main register's
+// screen. It loads the exact same frontend bundle — just with a
+// "#quicksale" hash so the React side knows to render the stripped-down
+// layout instead of the full app shell. It shares the same database/API
+// as the main window (same main process), so stock and sales stay
+// perfectly in sync between the two.
+// =================================================================
+let quickSaleWindows = new Set();
+
+function createQuickSaleWindow() {
+  const win = new BrowserWindow({
+    width: 1280,
+    height: 800,
+    minWidth: 640,
+    minHeight: 560,
+    show: false,
+    autoHideMenuBar: true,
+    title: 'Quick Sale',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      devTools: !app.isPackaged
+    }
+  });
+
+  // Same approach as the main window: open maximized so it always fills
+  // whatever screen it lands on (1920x1080, 1280x720, etc.) instead of a
+  // fixed pixel size that's right for one screen and cramped/cut off on
+  // another. width/height above just become its "restored" size if the
+  // cashier ever un-maximizes it.
+  win.maximize();
+
+  quickSaleWindows.add(win);
+  win.on('closed', () => quickSaleWindows.delete(win));
+  win.once('ready-to-show', () => win.show());
+
+  win.webContents.on('devtools-opened', () => {
+    if (app.isPackaged) win.webContents.closeDevTools();
+  });
+
+  if (app.isPackaged) {
+    win.loadFile(path.join(__dirname, 'frontend/dist/index.html'), { hash: 'quicksale' });
+  } else {
+    win.loadURL('http://localhost:5173/#quicksale');
+  }
+
+  return win;
+}
+
+ipcMain.handle('openQuickSaleWindow', (event) => {
+  createQuickSaleWindow();
+  return { success: true };
+});
+
+// Lets a renderer close its own window (used by the Quick Sale window to
+// close itself once its sale is done, and by its own Close button).
+ipcMain.handle('closeSelfWindow', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win && !win.isDestroyed()) win.close();
+  return { success: true };
+});
+
 app.whenReady().then(() => {
   createWindow();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
@@ -1454,28 +1591,18 @@ ipcMain.handle('deleteReturnTranscript', async (event, returnId) => {
 
 ipcMain.handle('getSalesHistory', async () => {
   if (IS_CLIENT) return networkCall('GET', '/api/sales', null, sysConfig);
-  return new Promise((resolve, reject) => {
+  const rows = await new Promise((resolve, reject) => {
     db.all(`SELECT * FROM sales_history ORDER BY timestamp DESC`, [], (err, rows) => {
       if (err) reject(err); else resolve(rows);
     });
   });
+  return attachLiveProductNames(rows);
 });
 
 ipcMain.handle('searchSalesHistory', async (event, query) => {
   if (IS_CLIENT) return networkCall('GET', `/api/sales/search?q=${encodeURIComponent(query || '')}`, null, sysConfig);
-  return new Promise((resolve, reject) => {
-    if (!query || query.trim() === '') {
-      return db.all(`SELECT * FROM sales_history ORDER BY timestamp DESC`, [], (err, rows) => {
-        if (err) reject(err); else resolve(rows);
-      });
-    }
-    let q = query.trim().toLowerCase().replace(/^inv-/, '').replace(/^sale-/, '').replace(/^ret-/, '');
-    db.all(
-      `SELECT * FROM sales_history WHERE LOWER(id) LIKE ? OR CAST(SUBSTR(id, 6) AS TEXT) = ? ORDER BY timestamp DESC`,
-      [`%${q}%`, q],
-      (err, rows) => { if (err) reject(err); else resolve(rows); }
-    );
-  });
+  const rows = await findSalesHistoryRows(query);
+  return attachLiveProductNames(rows);
 });
 
 // =================================================================

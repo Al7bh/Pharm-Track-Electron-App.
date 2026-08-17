@@ -5,12 +5,21 @@ import RestockScreen from "./components/RestockScreen";
 import SalesHistory from "./components/SalesHistory";
 import OwnerEarnings from "./components/OwnerEarnings";
 import receiptLogo from "./assets/receipt-logo.png";
-import { parsePharmacyBarcode } from "./utils/gs1Parser";
+import { parsePharmacyBarcode, getBarcodeLookupCandidates } from "./utils/gs1Parser";
 
+
+// True only in the small secondary window opened by Ctrl+N on the Sales
+// screen (see main.js's createQuickSaleWindow). Computed once at module
+// load from the URL hash — this window is never navigated anywhere else,
+// so it doesn't need to be reactive.
+const isQuickSaleWindow = typeof window !== "undefined" && window.location.hash === "#quicksale";
 
 function App() {
   const [currentTab, setCurrentTab] = useState("sales");
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  // The Quick Sale window is opened from an already-unlocked main
+  // register — it skips the login screen entirely so the second person
+  // isn't kept waiting at the counter.
+  const [isAuthenticated, setIsAuthenticated] = useState(isQuickSaleWindow);
   const [authForm, setAuthForm] = useState({ username: "", password: "" });
   const [showPassword, setShowPassword] = useState(false); // NEW
   const [attempts, setAttempts] = useState(0);
@@ -334,13 +343,26 @@ function App() {
 
           currentScanData = currentScanData.replace(/\*/g, "");
           if (currentScanData) {
+            // Same guard as sanitizeScannerPayload in gs1Parser.js: only
+            // strip a HANDFUL of stray leading bytes, never jump forward
+            // to a coincidental "01"+14-digit run deep in the string —
+            // confirmed against real inventory rows where an unguarded
+            // jump fabricated a GTIN with no real basis from a barcode
+            // that wasn't GS1-128 at all. Keep this in sync with that
+            // function if either one changes.
+            const MAX_NOISE_PREFIX = 5;
             const startMatch = currentScanData.match(/01\d{14}/);
-            if (startMatch && startMatch.index !== undefined && startMatch.index > 0) {
+            if (
+              startMatch &&
+              startMatch.index !== undefined &&
+              startMatch.index > 0 &&
+              startMatch.index <= MAX_NOISE_PREFIX
+            ) {
               currentScanData = currentScanData.slice(startMatch.index);
             }
           }
 
-          if (/^(INV-|sale-)\d+$/i.test(currentScanData)) {
+          if (/^(INV-|sale-)\d+$/i.test(currentScanData) && !isQuickSaleWindow) {
             const cleanId = currentScanData.replace(/^(INV-|sale-)/i, "");
             live.setCurrentTab("history");
             live.setScannedInvoiceId(`sale-${cleanId}`);
@@ -352,9 +374,20 @@ function App() {
           if (live.currentTab === "sales") {
             live.setSearchQuery("");
             if (window.electronAPI && window.electronAPI.getProductsByBarcode) {
-              const dbProducts = await window.electronAPI.getProductsByBarcode(
-                parsedData.gtin,
-              );
+              // Backward compatibility: some existing inventory rows still
+              // have the full raw/unparsed scan stored as their barcode,
+              // from before this parser correctly recognized their
+              // format. Try the clean parsed GTIN first (the correct,
+              // going-forward match), then fall back through
+              // progressively less-cleaned forms of the same scan, so a
+              // product saved under the old raw text is still found here
+              // instead of showing "Item Not Found".
+              const lookupCandidates = getBarcodeLookupCandidates(currentScanData);
+              let dbProducts = [];
+              for (const candidate of lookupCandidates) {
+                dbProducts = await window.electronAPI.getProductsByBarcode(candidate);
+                if (dbProducts && dbProducts.length > 0) break;
+              }
 
               if (
                 dbProducts &&
@@ -391,6 +424,94 @@ function App() {
 
     window.addEventListener("keydown", handleGlobalBarcodeScan);
     return () => window.removeEventListener("keydown", handleGlobalBarcodeScan);
+  }, []);
+
+  // =========================================================================
+  // KEYBOARD SHORTCUTS
+  // Ctrl/Cmd+N — open a new Quick Sale window (for a second person at the
+  //   counter). Ctrl/Cmd+S — focus the header search bar. Ctrl/Cmd+Shift+S —
+  //   focus the search box belonging to whichever screen is currently open
+  //   (Stock Management's ledger search, Restock's scan/search box, Sales
+  //   History's invoice/product search — the header bar itself on Sales,
+  //   since that IS its search box). Ctrl/Cmd+P — complete the sale (same
+  //   as clicking Checkout) while on the Sales screen.
+  // shortcutLiveRef keeps this one-time-attached listener free of stale
+  // closures, the same way scanLiveRef does above.
+  // =========================================================================
+  const shortcutLiveRef = useRef({});
+  useEffect(() => {
+    shortcutLiveRef.current = {
+      isAuthenticated,
+      currentTab,
+      cart,
+      isProcessingSale,
+      handleCheckoutSale,
+    };
+  });
+
+  useEffect(() => {
+    // The header search bar (top nav, "Search formulations...") is always
+    // mounted regardless of which screen is open — that's the target for
+    // plain Ctrl/Cmd+S.
+    const focusHeaderSearchField = () => {
+      const el = document.querySelector('input[placeholder="Search formulations..."]');
+      if (el) {
+        el.focus();
+        if (typeof el.select === "function") el.select();
+      }
+    };
+
+    // Ctrl/Cmd+Shift+S targets whichever screen you're actually looking
+    // at instead — its own dedicated search box, separate from the header
+    // one above.
+    const screenSearchSelectorByTab = {
+      sales: 'input[placeholder="Search formulations..."]',
+      inventory: 'input[placeholder="Search ledger items..."]',
+      restock: 'input[placeholder*="Scan a barcode, or search by product name"]',
+      history: 'input[placeholder="Search Invoice ID or Product..."]',
+    };
+
+    const focusScreenSearchField = (tab) => {
+      const selector = screenSearchSelectorByTab[tab] || screenSearchSelectorByTab.sales;
+      const el = document.querySelector(selector);
+      if (el) {
+        el.focus();
+        if (typeof el.select === "function") el.select();
+      }
+    };
+
+    const handleShortcutKeyDown = (e) => {
+      const live = shortcutLiveRef.current;
+      if (!live.isAuthenticated) return;
+      if (!(e.ctrlKey || e.metaKey)) return;
+
+      const key = e.key.toLowerCase();
+
+      if (key === "n") {
+        // The Quick Sale window itself doesn't spawn further windows.
+        if (isQuickSaleWindow) return;
+        e.preventDefault();
+        if (window.electronAPI && window.electronAPI.openQuickSaleWindow) {
+          window.electronAPI.openQuickSaleWindow();
+        }
+      } else if (key === "s") {
+        e.preventDefault();
+        if (e.shiftKey) {
+          focusScreenSearchField(live.currentTab);
+        } else {
+          focusHeaderSearchField();
+        }
+      } else if (key === "p") {
+        if (live.currentTab !== "sales") return;
+        e.preventDefault();
+        if (live.cart.length > 0 && !live.isProcessingSale) {
+          live.handleCheckoutSale();
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleShortcutKeyDown);
+    return () => window.removeEventListener("keydown", handleShortcutKeyDown);
   }, []);
 
   // Handle click outside search box to hide dropdown list
@@ -1031,6 +1152,14 @@ showNotification(
         setNoPrintMode(false);
         refreshStockLedger();
         refreshSalesHistory();
+
+        // Quick Sale windows are single-purpose: once this sale is recorded
+        // (and printed, or not — that choice above is unaffected), the
+        // window's job is done. Give the cashier a beat to see the "sale
+        // complete" toast, then close it automatically.
+        if (isQuickSaleWindow && window.electronAPI && window.electronAPI.closeSelfWindow) {
+          setTimeout(() => window.electronAPI.closeSelfWindow(), 900);
+        }
       } catch (err) {
         showNotification("Checkout Failed", friendlyErrorMessage(err, "This sale couldn't be completed. Please try again."), "error");
       } finally {
@@ -1574,19 +1703,21 @@ showNotification("Error", "Could not verify your PIN. Please try again.", "error
       >
         {/* LEFT NAV TOGGLE & LOGO */}
         <div className="flex items-center gap-3">
-          <button
-            onClick={() => setIsSidebarOpen(!isSidebarOpen)}
-            className={`p-1.5 -ml-2 rounded-xl flex items-center justify-center transition-colors ${lightMode ? "hover:bg-slate-100 text-slate-700" : "hover:bg-slate-800 text-slate-300"}`}
-          >
-            <span className="material-symbols-outlined text-[24px]">menu</span>
-          </button>
+          {!isQuickSaleWindow && (
+            <button
+              onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+              className={`p-1.5 -ml-2 rounded-xl flex items-center justify-center transition-colors ${lightMode ? "hover:bg-slate-100 text-slate-700" : "hover:bg-slate-800 text-slate-300"}`}
+            >
+              <span className="material-symbols-outlined text-[24px]">menu</span>
+            </button>
+          )}
           <span className="text-xl font-black bg-gradient-to-r from-emerald-400 to-teal-400 bg-clip-text text-transparent tracking-tight uppercase">
             PharmTrack
           </span>
           <span
             className={`hidden md:inline-block text-[10px] font-mono tracking-widest uppercase border px-2 py-0.5 rounded-md font-bold ${lightMode ? "bg-slate-100 text-slate-600 border-slate-200" : "bg-slate-950 text-slate-400 border-slate-800"}`}
           >
-            POS Core
+            {isQuickSaleWindow ? "Quick Sale" : "POS Core"}
           </span>
         </div>
 
@@ -1723,6 +1854,12 @@ showNotification("Error", "Could not verify your PIN. Please try again.", "error
           </button>
           <div
             onClick={() => {
+              if (isQuickSaleWindow) {
+                if (window.electronAPI && window.electronAPI.closeSelfWindow) {
+                  window.electronAPI.closeSelfWindow();
+                }
+                return;
+              }
               setIsAuthenticated(false);
               setIsEarningAuthenticated(false);
               setAuthForm({ username: "", password: "" });
@@ -1731,10 +1868,14 @@ showNotification("Error", "Could not verify your PIN. Please try again.", "error
             className={`cursor-pointer flex items-center gap-2 border px-3 py-1.5 rounded-xl transition-colors duration-200 ${lightMode ? "bg-slate-50 border-slate-200 text-slate-700 hover:border-rose-300" : "bg-slate-900 border-slate-800 text-slate-300 hover:border-rose-500/30"}`}
           >
             <div className="w-7 h-7 rounded-lg bg-slate-200 border border-slate-300 flex items-center justify-center font-black text-xs text-emerald-600">
-              FR
+              {isQuickSaleWindow ? (
+                <span className="material-symbols-outlined text-[16px]">close</span>
+              ) : (
+                "FR"
+              )}
             </div>
             <span className="hidden md:block text-[10px] font-mono uppercase tracking-wider text-slate-500 font-bold">
-              Lock
+              {isQuickSaleWindow ? "Close" : "Lock"}
             </span>
           </div>
         </div>
@@ -1743,9 +1884,13 @@ showNotification("Error", "Could not verify your PIN. Please try again.", "error
       {/* MAIN CONTENT AREA */}
       <div className="flex flex-1 h-[calc(100vh-64px)] w-full overflow-hidden min-h-0 relative">
         {/* INVISIBLE SPACER */}
-        <div className={`shrink-0 transition-[width] duration-300 h-full ${isSidebarOpen ? "w-[84px] xl:w-[260px]" : "w-[84px]"}`} />
+        {!isQuickSaleWindow && (
+          <div className={`shrink-0 transition-[width] duration-300 h-full ${isSidebarOpen ? "w-[84px] xl:w-[260px]" : "w-[84px]"}`} />
+        )}
 
-        {/* ACTUAL SIDEBAR */}
+        {/* ACTUAL SIDEBAR — hidden in the Quick Sale window, which is
+            locked to the Sales screen only */}
+        {!isQuickSaleWindow && (
         <aside className={`absolute left-0 top-0 h-full z-[100] border-r shrink-0 transition-[all] duration-300 overflow-hidden ${
           isSidebarOpen ? "w-[260px] shadow-[20px_0_40px_rgba(0,0,0,0.1)] xl:shadow-none" : "w-[84px] shadow-none"
         } ${lightMode ? "bg-slate-50 border-slate-200" : "bg-slate-900/95 backdrop-blur-2xl border-slate-800/80"}`}>
@@ -1805,6 +1950,7 @@ showNotification("Error", "Could not verify your PIN. Please try again.", "error
             )}
           </div>
         </aside>
+        )}
         
         {/* DYNAMIC CENTER SCREEN */}
         <div className="flex-1 flex overflow-hidden min-h-0 w-full h-full relative z-0">

@@ -57,16 +57,16 @@ function OwnerEarnings({ inventory, salesHistory, lightMode, onDeleteReturnTrans
   const totalRefunds = Math.round(filteredSales.reduce((sum, record) => record.id.startsWith("RET-") ? sum + Math.abs(record.grandTotal || 0) : sum, 0));
   const totalDiscounts = Math.round(filteredSales.reduce((sum, record) => !record.id.startsWith("RET-") ? sum + (record.discountDeduction || 0) : sum, 0));
 
-  // =========================================================================
-  // UPDATED CRASH-PROOF & NO-DOUBLE-DEDUCT PROFIT CALCULATOR (Now with Price Snapshots)
-  // =========================================================================
-  const totalNetProfit = Math.round(filteredSales.reduce((sum, record) => {
-    // We ignore RET- invoices for the profit calculus entirely.
-    if (record.id.startsWith("RET-")) return sum;
+  // Shared per-sale profit calculation — used both for the top-line Net
+  // Profit figure and for the daily/weekly/monthly profit bars in the graph
+  // below, so the two numbers can never drift apart. Returns/refunds
+  // contribute 0 (their effect already nets out of revenue elsewhere).
+  const calculateSaleProfit = (record) => {
+    if (record.id.startsWith("RET-")) return 0;
 
     let itemsArray = [];
-    try { itemsArray = JSON.parse(record.itemsJson) || []; } catch(e) {}
-    
+    try { itemsArray = JSON.parse(record.itemsJson) || []; } catch (e) {}
+
     const actualRevenue = record.grandTotal || 0;
     let totalCostForThisSale = 0;
 
@@ -79,7 +79,7 @@ function OwnerEarnings({ inventory, salesHistory, lightMode, onDeleteReturnTrans
         const liveItem = inventory.find(inv => inv.id?.toString() === targetId?.toString());
         const packFactor = liveItem?.factor || 2; // Defaulting to your pack factor of 2
         const liveBoxCost = parseFloat(liveItem?.buyingPrice) || 0;
-        
+
         if (item.type === "Box") {
           historicalCost = liveBoxCost;
         } else if (item.type === "Strip") {
@@ -93,9 +93,13 @@ function OwnerEarnings({ inventory, salesHistory, lightMode, onDeleteReturnTrans
       totalCostForThisSale += (historicalCost * (item.qty || 1));
     });
 
-    const transactionProfit = actualRevenue - totalCostForThisSale;
-    return sum + transactionProfit; // Add the clean, post-return profit of the invoice
-  }, 0));
+    return actualRevenue - totalCostForThisSale;
+  };
+
+  // =========================================================================
+  // UPDATED CRASH-PROOF & NO-DOUBLE-DEDUCT PROFIT CALCULATOR (Now with Price Snapshots)
+  // =========================================================================
+  const totalNetProfit = Math.round(filteredSales.reduce((sum, record) => sum + calculateSaleProfit(record), 0));
 
   const getGraphData = () => {
     const currentDate = new Date();
@@ -108,7 +112,8 @@ function OwnerEarnings({ inventory, salesHistory, lightMode, onDeleteReturnTrans
           label: d.toLocaleString('en-US', { month: 'short' }),
           matchId: `${d.getFullYear()}-${d.getMonth()}`,
           revenue: 0,
-          refunds: 0
+          refunds: 0,
+          profit: 0
         });
       }
       salesHistory.forEach(record => {
@@ -117,7 +122,10 @@ function OwnerEarnings({ inventory, salesHistory, lightMode, onDeleteReturnTrans
         const point = dataPoints.find(p => p.matchId === key);
         if (point) {
           if (record.id.startsWith("RET-")) point.refunds += Math.abs(record.grandTotal || 0);
-          else point.revenue += (record.grandTotal || 0);
+          else {
+            point.revenue += (record.grandTotal || 0);
+            point.profit += calculateSaleProfit(record);
+          }
         }
       });
     } else if (graphView === "weekly") {
@@ -128,7 +136,8 @@ function OwnerEarnings({ inventory, salesHistory, lightMode, onDeleteReturnTrans
           daysAgoStart: (i + 1) * 7,
           daysAgoEnd: i * 7,
           revenue: 0,
-          refunds: 0
+          refunds: 0,
+          profit: 0
         });
       }
       const endOfToday = new Date(currentDate.getFullYear(), currentDate.getMonth(), currentDate.getDate(), 23, 59, 59);
@@ -138,11 +147,17 @@ function OwnerEarnings({ inventory, salesHistory, lightMode, onDeleteReturnTrans
         dataPoints.forEach(w => {
           if (daysDiff >= w.daysAgoEnd && daysDiff < w.daysAgoStart) {
             if(record.id.startsWith("RET-")) w.refunds += Math.abs(record.grandTotal || 0);
-            else w.revenue += (record.grandTotal || 0);
+            else {
+              w.revenue += (record.grandTotal || 0);
+              w.profit += calculateSaleProfit(record);
+            }
           }
         });
       });
     } else {
+      // Daily — this is the "daily profit scale" view: each bar is one
+      // calendar day (last 7 days), so the profit trend day-over-day is
+      // visible at a glance, not just lumped into a monthly/weekly total.
       for (let i = 6; i >= 0; i--) {
         const targetDay = new Date(currentDate.getTime() - (i * 24 * 60 * 60 * 1000));
         const dayString = targetDay.getDate();
@@ -151,7 +166,8 @@ function OwnerEarnings({ inventory, salesHistory, lightMode, onDeleteReturnTrans
           label: i === 0 ? "Today" : `${dayString} ${monthString}`,
           matchKey: targetDay.toDateString(),
           revenue: 0,
-          refunds: 0
+          refunds: 0,
+          profit: 0
         });
       }
       salesHistory.forEach(record => {
@@ -159,12 +175,15 @@ function OwnerEarnings({ inventory, salesHistory, lightMode, onDeleteReturnTrans
         const point = dataPoints.find(p => p.matchKey === recDayString);
         if (point) {
             if(record.id.startsWith("RET-")) point.refunds += Math.abs(record.grandTotal || 0);
-            else point.revenue += (record.grandTotal || 0);
+            else {
+              point.revenue += (record.grandTotal || 0);
+              point.profit += calculateSaleProfit(record);
+            }
         }
       });
     }
 
-    const maxChartValue = Math.max(...dataPoints.map(p => Math.max(p.revenue, p.refunds)), 1000);
+    const maxChartValue = Math.max(...dataPoints.map(p => Math.max(p.revenue, p.refunds, p.profit)), 1000);
     return { dataPoints, maxChartValue };
   };
 
@@ -335,6 +354,9 @@ function OwnerEarnings({ inventory, salesHistory, lightMode, onDeleteReturnTrans
                   <div className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
                     <div className="w-2.5 h-2.5 bg-rose-500 rounded-sm"></div> Refunds
                   </div>
+                  <div className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                    <div className="w-2.5 h-2.5 bg-violet-500 rounded-sm"></div> Profit
+                  </div>
                 </div>
                 
                 <div className={`flex p-1 rounded-xl border ${lightMode ? "bg-slate-50 border-slate-200/80" : "bg-slate-950 border-slate-800/80"}`}>
@@ -363,18 +385,24 @@ function OwnerEarnings({ inventory, salesHistory, lightMode, onDeleteReturnTrans
                   {dataPoints.map((p, index) => {
                     const revHeight = Math.max(2, (p.revenue / maxChartValue) * 100);
                     const refHeight = Math.max(2, (p.refunds / maxChartValue) * 100);
+                    // Profit can go negative on a bad day (heavy discounts/refunds) —
+                    // the bar itself floors at 0 (there's no "negative height"),
+                    // but the tooltip always shows the true signed figure.
+                    const profitHeight = Math.max(2, (Math.max(0, p.profit) / maxChartValue) * 100);
                     return (
                       <div key={index} className="flex-1 flex flex-col items-center h-full justify-end group z-10 relative">
-                        <div className={`opacity-0 group-hover:opacity-100 scale-95 group-hover:scale-100 transition-all duration-150 absolute -top-14 text-[10px] font-black p-2.5 rounded-xl shadow-xl font-mono whitespace-nowrap z-50 flex flex-col gap-1 pointer-events-none ${
+                        <div className={`opacity-0 group-hover:opacity-100 scale-95 group-hover:scale-100 transition-all duration-150 absolute -top-16 text-[10px] font-black p-2.5 rounded-xl shadow-xl font-mono whitespace-nowrap z-50 flex flex-col gap-1 pointer-events-none ${
                           lightMode ? "bg-slate-900 text-white border border-slate-950" : "bg-slate-800 text-slate-100 border border-slate-700"
                         }`}>
                           <div className="text-emerald-400 flex justify-between gap-4"><span>Sales:</span> <span>Rs. {Math.round(p.revenue).toLocaleString()}</span></div>
                           <div className="text-rose-400 flex justify-between gap-4"><span>Refunds:</span> <span>Rs. {Math.round(p.refunds).toLocaleString()}</span></div>
+                          <div className={`flex justify-between gap-4 ${p.profit < 0 ? "text-rose-400" : "text-violet-400"}`}><span>Profit:</span> <span>Rs. {Math.round(p.profit).toLocaleString()}</span></div>
                         </div>
 
                         <div className="w-full flex items-end justify-center gap-0.5 sm:gap-1 h-full relative">
-                          <div style={{ height: `${revHeight}%` }} className={`w-1/2 max-w-[24px] rounded-t-md transition-all duration-700 relative shadow-sm ${lightMode ? "bg-emerald-500 group-hover:brightness-110" : "bg-emerald-500/80 group-hover:brightness-120"}`} />
-                          <div style={{ height: `${refHeight}%` }} className={`w-1/2 max-w-[24px] rounded-t-md transition-all duration-700 relative shadow-sm ${lightMode ? "bg-rose-500 group-hover:brightness-110" : "bg-rose-500/80 group-hover:brightness-120"}`} />
+                          <div style={{ height: `${revHeight}%` }} className={`w-1/3 max-w-[18px] rounded-t-md transition-all duration-700 relative shadow-sm ${lightMode ? "bg-emerald-500 group-hover:brightness-110" : "bg-emerald-500/80 group-hover:brightness-120"}`} />
+                          <div style={{ height: `${refHeight}%` }} className={`w-1/3 max-w-[18px] rounded-t-md transition-all duration-700 relative shadow-sm ${lightMode ? "bg-rose-500 group-hover:brightness-110" : "bg-rose-500/80 group-hover:brightness-120"}`} />
+                          <div style={{ height: `${profitHeight}%` }} className={`w-1/3 max-w-[18px] rounded-t-md transition-all duration-700 relative shadow-sm ${p.profit < 0 ? "bg-rose-600" : lightMode ? "bg-violet-500 group-hover:brightness-110" : "bg-violet-500/80 group-hover:brightness-120"}`} />
                         </div>
                         
                         <span className="text-[9px] font-black uppercase tracking-widest text-slate-400 select-none text-center h-4 mt-1.5 whitespace-nowrap">

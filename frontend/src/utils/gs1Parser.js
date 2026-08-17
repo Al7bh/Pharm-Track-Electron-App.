@@ -79,8 +79,24 @@ export const sanitizeScannerPayload = (scan) => {
 
   if (!sanitized) return "";
 
+  // This is meant to strip a HANDFUL of stray leading bytes a misconfigured
+  // scanner sometimes injects before the real code — not to jump forward
+  // to any coincidental "01"+14-digit run anywhere in the string. A large
+  // jump distance means what's being discarded is very likely the actual
+  // intended start of a different, non-GS1-128 barcode that just happens
+  // to contain a matching digit run further in — confirmed against two
+  // real inventory rows where this fabricated a GTIN with no real basis
+  // (from barcodes starting "8014..." and "1210...", neither of which is
+  // GS1-128 at all). Genuine leading scanner noise is a few stray
+  // characters, not dozens.
+  const MAX_NOISE_PREFIX = 5;
   const startMatch = sanitized.match(/01\d{14}/);
-  if (startMatch && startMatch.index !== undefined && startMatch.index > 0) {
+  if (
+    startMatch &&
+    startMatch.index !== undefined &&
+    startMatch.index > 0 &&
+    startMatch.index <= MAX_NOISE_PREFIX
+  ) {
     sanitized = sanitized.slice(startMatch.index);
   }
 
@@ -116,7 +132,11 @@ const isValidYYMMDD = (sixDigits) => {
   if (!/^\d{6}$/.test(sixDigits)) return false;
   const mm = parseInt(sixDigits.slice(2, 4), 10);
   const dd = parseInt(sixDigits.slice(4, 6), 10);
-  return mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31;
+  // GS1 allows DD = "00" on AI 17 to mean "no specific day" (commonly read
+  // as end-of-month) — that's a real, spec-legal value, not garbage, and
+  // rejecting it was silently failing every scan that used it (confirmed
+  // against real scans in this pharmacy's batch that use day "00").
+  return mm >= 1 && mm <= 12 && dd >= 0 && dd <= 31;
 };
 
 const findValidExpiryPosition = (rest) => {
@@ -127,6 +147,71 @@ const findValidExpiryPosition = (rest) => {
     if (isValidYYMMDD(rest.slice(idx + 2, idx + 8))) return idx;
     i = idx + 1;
   }
+};
+
+// Matches this pharmacy's various "Rs" price notations, all seen in real
+// scans: Rs100, Rs.100, Rs. 100, Rs:100, Rs: 100 — and the same preceded by
+// a stray apostrophe or trailing "s" pack-size artifact ("Tab'Rs:510.00",
+// "tab28sRs.1064") or an "MRP." prefix ("MRP.Rs.900.00", "MRP.Rs. 407.00").
+// The separator after "Rs" (".", ":", or nothing) and the whitespace around
+// it are both optional because different scans from this pharmacy are
+// inconsistent about them.
+const PRICE_REGEX = /^(.*?)s?\W*?Rs\s*[.:]?\s*(\d+(?:\.\d+)?)/i;
+
+// "MRP" (Maximum Retail Price) is a label prefix printed right before the
+// price, not a product name — this pharmacy's scans just don't separate
+// them. Treating it as a real name (confirmed: several scans were showing
+// "MRP" as the product name) is wrong; when that's all we've got, leave
+// name blank so the app falls back to looking the product up by GTIN.
+const isPlaceholderName = (name) => /^m\.?\s*r\.?\s*p\.?$/i.test(name);
+
+const splitNameAndPrice = (text) => {
+  const match = text.match(PRICE_REGEX);
+  if (match) {
+    const name = match[1].trim();
+    return { name: isPlaceholderName(name) ? "" : name, retailPrice: match[2] };
+  }
+  const name = text.trim();
+  return { name: isPlaceholderName(name) ? "" : name, retailPrice: "" };
+};
+
+// AI 11 (production/pack date) is fixed-length (6 digits) just like AI 17,
+// and this pharmacy's generator sometimes chains it directly after the
+// batch with no separator: batch(10) -> prodDate(11) -> expiry(17). Left
+// unhandled, the whole "batch + AI11 marker + production date" span gets
+// swallowed into batch — confirmed against a real scan where the expected
+// batch was "152" but the parser produced "15211260702" (batch + "11" + a
+// valid production date, glued on with nothing to mark the boundary).
+// Checking specifically the LAST 8 characters of the candidate batch is
+// what's safe here: production date always sits immediately before
+// expiry, so if the tail is "11" plus a real calendar date, that's it.
+// Also reports whether it actually found one, since that's used below as
+// a signal for a second, narrower cleanup step.
+const stripEmbeddedProductionDate = (batchCandidate) => {
+  if (batchCandidate.length < 8) return { batch: batchCandidate, hadProductionDate: false };
+  const tail = batchCandidate.slice(-8);
+  if (tail.startsWith("11") && isValidYYMMDD(tail.slice(2))) {
+    return { batch: batchCandidate.slice(0, -8), hadProductionDate: true };
+  }
+  return { batch: batchCandidate, hadProductionDate: false };
+};
+
+// Seen so far in exactly one scan (GTIN 08966000036901: "2448A0324", once
+// the production date above is stripped off). This pharmacy's vendor for
+// that product glues a 4-digit sub-code directly in front of the real
+// batch with nothing marking the boundary — the physical label's actual
+// batch is "A0324", not "2448A0324".
+//
+// This is deliberately scoped tight — only applied when we ALSO found a
+// real embedded production date on this same candidate (hadProductionDate)
+// — so it can't touch ordinary batches that happen to start with 4 digits
+// followed by a letter but have no production date attached, like
+// "0033T212" / "0027T308" / "0006T610", which are confirmed-correct as-is
+// and would otherwise match this same shape.
+const maybeStripVendorSubcode = (batch, hadProductionDate) => {
+  if (!hadProductionDate) return batch;
+  const match = batch.match(/^(\d{4})([A-Za-z].*)$/);
+  return match ? match[2] : batch;
 };
 
 // Parses whatever comes after batch+expiry are already resolved — a chain
@@ -151,18 +236,96 @@ const parseTrailingChain = (tail, parsed) => {
     remaining = rest.slice(nextIdx);
 
     if (marker === "240") {
-      const rsMatch = value.match(/(.*?)Rs\.?(\d+(\.\d+)?)/i);
-      if (rsMatch) {
-        parsed.name = rsMatch[1].trim();
-        parsed.retailPrice = rsMatch[2];
-      } else if (value.trim()) {
-        parsed.name = value.trim();
-      }
+      const { name, retailPrice } = splitNameAndPrice(value);
+      if (name) parsed.name = name;
+      if (retailPrice) parsed.retailPrice = retailPrice;
     }
     // AI 21 (serial number) isn't used elsewhere in this app — resolving
     // it out of the chain matters so it doesn't get left dangling inside
     // the batch or name, but the value itself doesn't need to be kept.
   }
+};
+
+// Shared by both "expiry comes before batch" orderings below (17-then-10,
+// and the newer 21-then-17-then-10). In both cases, once expiry has been
+// located, what's left must start with the batch marker "10" — this
+// pharmacy's generator always puts batch right after expiry in that
+// ordering, with an optional 240 name/price blob (and/or a 21 serial)
+// chained after it.
+const resolveBatchAndTrailing = (afterExpiry) => {
+  if (!afterExpiry.startsWith("10")) return null;
+  const batchRegion = afterExpiry.slice(2);
+
+  const rsIdx = batchRegion.search(/s?\W*?Rs\s*[.:]?\s*\d/i);
+  const preRs = rsIdx >= 0 ? batchRegion.slice(0, rsIdx) : batchRegion;
+
+  // A batch region can ALSO have a genuine AI 21 (serial number) embedded
+  // before the 240 name blob — not just after the price at the very end,
+  // where parseTrailingChain already handles it. Confirmed against a real
+  // scan: "FW0053" + serial "21A28Z2OA1DEFC3A8" + "240Eye Susp", with no
+  // separator marking where the serial starts.
+  //
+  // This has to be told apart from the coincidental "21" case above (e.g.
+  // "0033T212", where "21" is just two digits of the batch number). The
+  // reliable signal: a genuine embedded serial here is always short-range
+  // uppercase/digits with NO lowercase letters, running all the way to
+  // the next marker — a coincidental match runs straight into ordinary
+  // batch digits or lowercase name text within just a character or two,
+  // which is why the length and no-lowercase checks below both matter.
+  const findGenuineSerialBoundary = (text) => {
+    let i = 0;
+    while (true) {
+      const idx = text.indexOf("21", i);
+      if (idx === -1) return -1;
+      const after = text.slice(idx + 2);
+      const nameIdx = after.indexOf("240");
+      const span = nameIdx >= 0 ? after.slice(0, nameIdx) : after;
+      if (span.length >= 4 && !/[a-z]/.test(span)) return idx;
+      i = idx + 1;
+    }
+  };
+
+  const finalizeBatch = (candidate) => {
+    const { batch, hadProductionDate } = stripEmbeddedProductionDate(candidate);
+    return maybeStripVendorSubcode(batch, hadProductionDate);
+  };
+
+  const serialIdx = findGenuineSerialBoundary(preRs);
+  if (serialIdx !== -1) {
+    const out = { batch: finalizeBatch(preRs.slice(0, serialIdx).trim()), name: "", retailPrice: "" };
+    parseTrailingChain(batchRegion.slice(serialIdx), out);
+    return out;
+  }
+
+  // Only "240" counts as a batch/name boundary here — NOT "21" (handled
+  // above, only when it looks genuine). A coincidental "21" substring
+  // inside the batch code itself must not truncate it early — confirmed
+  // against a real scan where a batch like "0033T212" contains "21"
+  // purely by chance, two characters before the real "240" marker.
+  //
+  // "240" itself can still appear coincidentally inside a longer numeric
+  // batch — a REAL AI 240 marker is always followed by actual
+  // product-name text (letters); a coincidental match is followed by more
+  // digits (continuing the batch number) or just a trailing "s" artifact —
+  // checking for that is what tells them apart reliably.
+  const markerMatch = preRs.match(/^(.*?)(240)/);
+  const afterMarker = markerMatch ? preRs.slice(markerMatch[1].length + markerMatch[2].length) : "";
+  const looksLikeRealName = /[A-Za-z].*[A-Za-z]/.test(afterMarker.replace(/s$/i, ""));
+
+  if (markerMatch && looksLikeRealName) {
+    const out = { batch: finalizeBatch(markerMatch[1].trim()), name: "", retailPrice: "" };
+    parseTrailingChain(batchRegion.slice(markerMatch[1].length), out);
+    return out;
+  }
+
+  const rsMatch = batchRegion.match(PRICE_REGEX);
+  if (rsMatch) {
+    return { batch: finalizeBatch(rsMatch[1].trim()), retailPrice: rsMatch[2], name: "" };
+  }
+
+  // No recognizable terminator at all — keep the whole remainder as
+  // batch rather than discarding it.
+  return { batch: finalizeBatch(batchRegion.trim()), name: "", retailPrice: "" };
 };
 
 const parseNoSeparatorFallback = (sanitized) => {
@@ -178,47 +341,14 @@ const parseNoSeparatorFallback = (sanitized) => {
   const expiry = `${year}-${expiryDigits.slice(2, 4)}`;
 
   if (rest.startsWith("17") && expPos === 0) {
-    // Order: GTIN -> expiry -> batch. Batch is bounded by a price marker
-    // (this pharmacy's own convention) or a genuine AI 240 marker — but
-    // "240" can also appear coincidentally as a plain digit sequence
-    // inside a longer numeric batch (confirmed: e.g. "...19624030s..."
-    // contains "240" purely by chance). A REAL AI 240 marker is always
-    // followed by actual product-name text (letters); a coincidental
-    // match is followed by more digits (continuing the batch number) or
-    // just the trailing "s" artifact — checking for that is what tells
-    // them apart reliably.
-    const afterExpiry = rest.slice(8);
-    if (!afterExpiry.startsWith("10")) return result;
-    const batchRegion = afterExpiry.slice(2);
-
-    const rsIdx = batchRegion.search(/s?\W*Rs\.?\d/i);
-    const preRs = rsIdx >= 0 ? batchRegion.slice(0, rsIdx) : batchRegion;
-    const markerMatch = preRs.match(/^(.*?)(21|240)/);
-    const afterMarker = markerMatch ? preRs.slice(markerMatch[1].length + markerMatch[2].length) : "";
-    const looksLikeRealName = /[A-Za-z].*[A-Za-z]/.test(afterMarker.replace(/s$/i, ""));
-
-    if (markerMatch && looksLikeRealName) {
-      result.gtin = gtin;
-      result.expiry = expiry;
-      result.batch = markerMatch[1].trim();
-      parseTrailingChain(batchRegion.slice(markerMatch[1].length), result);
-      return result;
-    }
-
-    const rsMatch = batchRegion.match(/^(.*?)s?\W*Rs\.?(\d+(\.\d+)?)/i);
-    if (rsMatch) {
-      result.gtin = gtin;
-      result.expiry = expiry;
-      result.batch = rsMatch[1].trim();
-      result.retailPrice = rsMatch[2];
-      return result;
-    }
-
-    // No recognizable terminator at all — keep the whole remainder as
-    // batch rather than discarding it.
+    // Order: GTIN -> expiry -> batch -> (name/serial chain).
+    const resolved = resolveBatchAndTrailing(rest.slice(expPos + 8));
+    if (!resolved) return result;
     result.gtin = gtin;
     result.expiry = expiry;
-    result.batch = batchRegion.trim();
+    result.batch = resolved.batch;
+    if (resolved.name) result.name = resolved.name;
+    if (resolved.retailPrice) result.retailPrice = resolved.retailPrice;
     return result;
   }
 
@@ -226,12 +356,117 @@ const parseNoSeparatorFallback = (sanitized) => {
     // Order: GTIN -> batch -> expiry -> (serial/name chain).
     result.gtin = gtin;
     result.expiry = expiry;
-    result.batch = rest.slice(2, expPos).trim();
+    const { batch, hadProductionDate } = stripEmbeddedProductionDate(rest.slice(2, expPos).trim());
+    result.batch = maybeStripVendorSubcode(batch, hadProductionDate);
     parseTrailingChain(rest.slice(expPos + 8), result);
     return result;
   }
 
-  return result; // doesn't fit either recognized shape — don't guess
+  if (rest.startsWith("21")) {
+    // Order: GTIN -> serial(21) -> expiry -> batch -> (name/serial chain).
+    // Reverse-engineered from real scans (this pharmacy's generator
+    // sometimes puts the serial number ahead of expiry/batch instead of
+    // after them) that previously parsed correctly under an older parser
+    // version but fall through as "no recognized shape" here without this
+    // branch. AI 21 has no separator and no fixed length to bound it, so —
+    // same as everywhere else in this fallback — the verified expiry
+    // position (not a length guess) is what tells us where the serial
+    // actually ends.
+    const resolved = resolveBatchAndTrailing(rest.slice(expPos + 8));
+    if (!resolved) return result;
+    result.gtin = gtin;
+    result.expiry = expiry;
+    result.batch = resolved.batch;
+    if (resolved.name) result.name = resolved.name;
+    if (resolved.retailPrice) result.retailPrice = resolved.retailPrice;
+    return result;
+  }
+
+  return result; // doesn't fit any recognized shape — don't guess
+};
+
+// =========================================================================
+// GTIN-LESS SCANS (secondary/supplementary label barcodes)
+// =========================================================================
+// Some of this pharmacy's items carry a SECOND barcode on the pack that
+// encodes only expiry + batch + price/name — no GTIN (AI 01) at all —
+// because the GTIN is already on a separate primary barcode elsewhere on
+// the box. Reverse-engineered from real scans of this exact shape: always
+// starts directly with AI 17 (expiry), then AI 10 (batch), then the usual
+// 240/21 trailing chain — e.g. raw "172804171011166240PurpalCaps20mg14sRs:280.00"
+// decodes as expiry 2028-04, batch "11166", name "PurpalCaps20mg14s", price
+// 280.00. Scoped to exactly that one confirmed ordering — unlike the
+// GTIN-bearing fallback above, there's no observed "batch-before-expiry,
+// no GTIN" scan from this pharmacy to build a second branch from, so that
+// shape isn't guessed at here.
+const parseNoGtinTrailingOnly = (sanitized) => {
+  const result = { gtin: null, batch: null, expiry: null, name: "", retailPrice: "" };
+  if (!sanitized.startsWith("17")) return result;
+
+  const expiryDigits = sanitized.slice(2, 8);
+  if (!isValidYYMMDD(expiryDigits)) return result;
+
+  const resolved = resolveBatchAndTrailing(sanitized.slice(8));
+  if (!resolved) return result;
+
+  const year = 2000 + parseInt(expiryDigits.slice(0, 2), 10);
+  result.expiry = `${year}-${expiryDigits.slice(2, 4)}`;
+  result.batch = resolved.batch;
+  if (resolved.name) result.name = resolved.name;
+  if (resolved.retailPrice) result.retailPrice = resolved.retailPrice;
+  return result;
+};
+
+// =========================================================================
+// PARENTHESIZED (HUMAN-READABLE) AI FORMAT
+// =========================================================================
+// Some scanners/printers emit GS1 data in its human-readable form instead
+// of FNC1-separated: every AI wrapped in literal parentheses OR square
+// brackets, e.g. "08964001855514(10)729E(17)310128(21)1457582534" or
+// "08964001857648[10]708E[17]300927[21]1444230235" (confirmed both styles
+// show up from this pharmacy's hardware — same data, different wrapper
+// character). Unlike every other pattern this file handles, the GTIN
+// itself isn't prefixed with "(01)"/"[01]" — it's just the bare 14 digits
+// up front, with every AI after it wrapped. That bare-digit start is
+// exactly why this was getting raw-scanned: it fails the "starts with 01"
+// plain-barcode check further down, so without this, it looked identical
+// to a non-GS1 EAN/UPC.
+const parseParenthesizedFormat = (sanitized) => {
+  if (!sanitized.includes("(") && !sanitized.includes("[")) return null;
+
+  const gtinMatch = sanitized.match(/^(?:[(\[]01[)\]])?(\d{14})/);
+  // Some of this pharmacy's items carry a SECOND barcode with no GTIN
+  // segment at all — e.g. "(17)290504(10)31708(240)BryskTab20mg20sRs:448.00" —
+  // because the GTIN is already on a separate primary barcode elsewhere on
+  // the pack. When there's no leading GTIN, just start scanning AI segments
+  // from the beginning instead of failing the whole line.
+  const result = { gtin: gtinMatch ? gtinMatch[1] : null, batch: null, expiry: null, name: "", retailPrice: "" };
+  const remaining = gtinMatch ? sanitized.slice(gtinMatch[0].length) : sanitized;
+
+  const segmentRegex = /[(\[](\d{2,3})[)\]]([^(\[]*)/g;
+  let match;
+  let foundAny = false;
+  while ((match = segmentRegex.exec(remaining)) !== null) {
+    foundAny = true;
+    const ai = match[1];
+    const value = match[2].trim();
+
+    if (ai === "10") {
+      result.batch = value;
+    } else if (ai === "17" && isValidYYMMDD(value)) {
+      const year = 2000 + parseInt(value.slice(0, 2), 10);
+      result.expiry = `${year}-${value.slice(2, 4)}`;
+    } else if (ai === "240") {
+      const { name, retailPrice } = splitNameAndPrice(value);
+      if (name) result.name = name;
+      if (retailPrice) result.retailPrice = retailPrice;
+    }
+    // AI 11 (production date), AI 21 (serial), and anything else: not
+    // surfaced elsewhere in this app — parsed only so they don't get
+    // mistaken for one of the fields above, value itself is discarded.
+  }
+
+  return foundAny ? result : null;
 };
 
 export const parsePharmacyBarcode = (scan) => {
@@ -247,6 +482,34 @@ export const parsePharmacyBarcode = (scan) => {
   const sanitized = sanitizeScannerPayload(scan);
   if (!sanitized) return parsed;
 
+  const parenthesized = parseParenthesizedFormat(sanitized);
+  if (parenthesized && parenthesized.batch && parenthesized.expiry) {
+    // No real GTIN on this scan (see parseParenthesizedFormat) — the full
+    // raw string is what gets stored/matched as this item's identifying
+    // barcode instead, same convention used everywhere else in this file.
+    parsed.gtin = parenthesized.gtin || sanitized;
+    parsed.batch = parenthesized.batch;
+    parsed.expiry = parenthesized.expiry;
+    if (parenthesized.name) parsed.name = parenthesized.name;
+    if (parenthesized.retailPrice) parsed.retailPrice = parenthesized.retailPrice;
+    return parsed;
+  }
+
+  // GTIN-less, non-parenthesized structured scan — same "no GTIN on this
+  // label" situation as above, just without the parentheses. See
+  // parseNoGtinTrailingOnly for the confirmed shape this covers.
+  if (!sanitized.startsWith("01")) {
+    const noGtin = parseNoGtinTrailingOnly(sanitized);
+    if (noGtin.batch && noGtin.expiry) {
+      parsed.gtin = sanitized;
+      parsed.batch = noGtin.batch;
+      parsed.expiry = noGtin.expiry;
+      if (noGtin.name) parsed.name = noGtin.name;
+      if (noGtin.retailPrice) parsed.retailPrice = noGtin.retailPrice;
+      return parsed;
+    }
+  }
+
   // Not every product barcode is full GS1-128 — some are plain EAN/UPC. In
   // that case there's no structure to decode; the raw scan itself IS the
   // identifying code, same as before.
@@ -254,6 +517,22 @@ export const parsePharmacyBarcode = (scan) => {
     parsed.gtin = sanitized;
     return parsed;
   }
+
+  // Whether this scan has a REAL GS1 field separator anywhere in it is
+  // the deciding factor for whether the third-party library can be
+  // trusted at all here — not just whether it happens to throw. A GS1-128
+  // decoder resolves variable-length field boundaries (like batch) from
+  // that separator; with none present, there's no spec-defined way for it
+  // to know where batch ends, so whatever it does in that situation is
+  // undocumented and unreliable rather than a real "success" — confirmed
+  // against real scans where the library returned a plausible-looking but
+  // WRONG batch/expiry (passing the structuredOk check below) for input
+  // that has no separator anywhere, instead of throwing as expected. This
+  // pharmacy has a large, well-understood population of exactly these
+  // no-separator scans (that's what parseNoSeparatorFallback exists for),
+  // so for those we skip the library entirely rather than gamble on
+  // whatever it does with input outside its spec-defined scope.
+  const hasRealSeparator = sanitized.includes(GS);
 
   // Defensive normalization: AI 17 (expiry) is fixed-length (exactly 6
   // digits) per the GS1 spec and technically needs no terminator — but
@@ -274,6 +553,7 @@ export const parsePharmacyBarcode = (scan) => {
 
   let structuredOk = false;
 
+  if (hasRealSeparator) {
   try {
     const result = gs1Parser.decode(normalized);
     const data = result.data || {};
@@ -290,13 +570,9 @@ export const parsePharmacyBarcode = (scan) => {
     // it back as opaque text; splitting it into name/price is this app's
     // own business logic on top.
     const extraText = (data.additionalProductID && data.additionalProductID.data) || "";
-    const rsMatch = extraText.match(/(.*?)Rs\.?(\d+(\.\d+)?)/i);
-    if (rsMatch) {
-      parsed.name = rsMatch[1].trim();
-      parsed.retailPrice = rsMatch[2];
-    } else if (extraText) {
-      parsed.name = extraText.trim();
-    }
+    const { name: extraName, retailPrice: extraPrice } = splitNameAndPrice(extraText);
+    if (extraName) parsed.name = extraName;
+    if (extraPrice) parsed.retailPrice = extraPrice;
 
     // Fallback for a specific, recurring encoding gap: some of this
     // pharmacy's barcodes have NO separator after the batch field at all
@@ -309,7 +585,7 @@ export const parsePharmacyBarcode = (scan) => {
     // and pull out whatever price follows, rather than leaving the price
     // text embedded inside the stored batch code.
     if (!parsed.retailPrice && parsed.batch) {
-      const batchPriceMatch = parsed.batch.match(/^(.*?)s?\W*Rs\.?(\d+(\.\d+)?)/i);
+      const batchPriceMatch = parsed.batch.match(PRICE_REGEX);
       if (batchPriceMatch) {
         parsed.batch = batchPriceMatch[1].trim();
         parsed.retailPrice = batchPriceMatch[2];
@@ -334,6 +610,7 @@ export const parsePharmacyBarcode = (scan) => {
     // Malformed/non-conforming GS1 data — fall through to the
     // no-separator fallback below.
   }
+  }
 
   // Only reached when the structured, spec-based decode above didn't
   // produce a usable batch+expiry — i.e. genuinely no separator anywhere
@@ -351,6 +628,47 @@ export const parsePharmacyBarcode = (scan) => {
   }
 
   return parsed;
+};
+
+// =========================================================================
+// LEGACY-DATA LOOKUP COMPATIBILITY
+// =========================================================================
+// Fixing the parser (above) only helps going forward. It does nothing for
+// the ~99 existing inventory rows whose `barcode` column already holds a
+// full raw/junk scan string, saved back when an earlier version of this
+// parser failed on that scan and (per parsePharmacyBarcode's own fallback
+// behavior) stored the raw text as if it were the identifying code. Once
+// the parser is fixed, scanning that SAME product at the sales screen
+// produces the correct clean GTIN — which no longer matches that stored
+// raw row, so the sale now fails with "no product" for those specific
+// items even though nothing about the physical barcode changed.
+//
+// This isn't something parsePharmacyBarcode itself can fix — it only
+// resolves what the scan *means*, not what's sitting in the database. The
+// sales-screen lookup needs to try more than one candidate string against
+// `inventory.barcode` before giving up. Use this helper there:
+//
+//   import { getBarcodeLookupCandidates } from "./gs1Parser";
+//   const candidates = getBarcodeLookupCandidates(rawScan);
+//   let product = null;
+//   for (const candidate of candidates) {
+//     product = await db.inventory.findByBarcode(candidate); // your existing lookup
+//     if (product) break;
+//   }
+//   if (!product) { /* existing "no product" handling */ }
+//
+// Order matters: the clean parsed GTIN is tried first (the correct,
+// going-forward match), then progressively less-cleaned forms of the same
+// scan, on the chance an older row still has one of those stored verbatim.
+// I don't have the sales-screen scan-handling file in front of me — if you
+// share it, I can wire this in directly instead of leaving it as a snippet.
+export const getBarcodeLookupCandidates = (scan) => {
+  const parsed = parsePharmacyBarcode(scan);
+  const sanitized = sanitizeScannerPayload(scan);
+  const original = (scan || "").trim();
+
+  const candidates = [parsed.gtin, sanitized, original].filter(Boolean);
+  return [...new Set(candidates)];
 };
 
 // A canonical, known-good test scan — useful for a quick sanity check

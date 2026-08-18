@@ -61,12 +61,20 @@ function RestockScreen({ inventory, onQuickRestock, onAddNewStock, lightMode, sc
   useEffect(() => {
     if (scannedData && scannedData.gtin) {
       setSearchQuery("");
+      // Match against every candidate form of this scan, not just the
+      // clean GTIN — an older row may still have the raw/unparsed scan
+      // stored as its barcode from before the parser recognized this
+      // format. See gs1Parser.js's "LEGACY-DATA LOOKUP COMPATIBILITY"
+      // section for why this list has more than one entry.
+      const candidates = scannedData.lookupCandidates && scannedData.lookupCandidates.length
+        ? scannedData.lookupCandidates
+        : [scannedData.gtin];
       const matches = inventory.filter(
-        (item) => item.barcode === scannedData.gtin && item.is_active !== 0
+        (item) => candidates.includes(item.barcode) && item.is_active !== 0
       );
 
       if (matches.length > 0) {
-        setActiveProductKey(scannedData.gtin);
+        setActiveProductKey(matches[0].barcode);
         setNotFoundBarcode(null);
         setInlineError("");
 

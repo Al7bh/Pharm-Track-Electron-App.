@@ -370,6 +370,16 @@ function App() {
           }
 
           const parsedData = parsePharmacyBarcode(currentScanData);
+          // Same legacy-compatibility problem exists on Inventory/Restock
+          // as on Sales (see the "sales" branch below): an older row may
+          // still have the raw/unparsed scan stored as its barcode. Attach
+          // the same candidate list here too, so those two screens' own
+          // barcode matching (in StockManagement.jsx / RestockScreen.jsx)
+          // can try all of them instead of just the clean GTIN.
+          const scanWithCandidates = {
+            ...parsedData,
+            lookupCandidates: getBarcodeLookupCandidates(currentScanData),
+          };
 
           if (live.currentTab === "sales") {
             live.setSearchQuery("");
@@ -382,7 +392,7 @@ function App() {
               // progressively less-cleaned forms of the same scan, so a
               // product saved under the old raw text is still found here
               // instead of showing "Item Not Found".
-              const lookupCandidates = getBarcodeLookupCandidates(currentScanData);
+              const lookupCandidates = scanWithCandidates.lookupCandidates;
               let dbProducts = [];
               for (const candidate of lookupCandidates) {
                 dbProducts = await window.electronAPI.getProductsByBarcode(candidate);
@@ -414,9 +424,9 @@ function App() {
               }
             }
           } else if (live.currentTab === "inventory") {
-            live.setScannedInventoryData(parsedData);
+            live.setScannedInventoryData(scanWithCandidates);
           } else if (live.currentTab === "restock") {
-            live.setScannedRestockData(parsedData);
+            live.setScannedRestockData(scanWithCandidates);
           }
         }
       }
@@ -2378,6 +2388,7 @@ showNotification("Error", "Could not verify your PIN. Please try again.", "error
               scannedData={scannedInventoryData}
               clearScannedData={() => setScannedInventoryData(null)}
               onGoToRestock={() => setCurrentTab("restock")}
+              isActiveTab={currentTab === "inventory"}
             />
           </div>
           <div className={currentTab === "restock" ? "flex-1 flex overflow-hidden w-full h-full bg-slate-950 min-h-0" : "hidden"}>

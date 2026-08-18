@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { ALL_CATEGORIES, categorizeProduct } from "../utils/categorize";
 
-function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteStock, lightMode, scannedData, clearScannedData, onGoToRestock }) {
+function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteStock, lightMode, scannedData, clearScannedData, onGoToRestock, isActiveTab }) {
   const currentDate = new Date();
   const currentYear = currentDate.getFullYear();
   const currentMonth = String(currentDate.getMonth() + 1).padStart(2, "0");
@@ -104,7 +104,15 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
     if (scannedData && scannedData.gtin) {
       setStockSearchQuery("");
 
-      const matchesByBarcode = inventory.filter((item) => item.barcode === scannedData.gtin);
+      // Match against every candidate form of this scan, not just the
+      // clean GTIN — an older row may still have the raw/unparsed scan
+      // stored as its barcode from before the parser recognized this
+      // format. See gs1Parser.js's "LEGACY-DATA LOOKUP COMPATIBILITY"
+      // section for why this list has more than one entry.
+      const scanCandidates = scannedData.lookupCandidates && scannedData.lookupCandidates.length
+        ? scannedData.lookupCandidates
+        : [scannedData.gtin];
+      const matchesByBarcode = inventory.filter((item) => scanCandidates.includes(item.barcode));
 
       if (matchesByBarcode.length > 0) {
         // 1. IF GS1 BARCODE (Contains embedded Batch info)
@@ -192,6 +200,17 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
   }, [quickAddDialog.isOpen]);
 
   useEffect(() => {
+    // This component stays mounted (just visually hidden) when the user
+    // switches to another tab, so its state — including any dialog left
+    // open — persists in the background. Without this guard, that meant
+    // a plain Enter/Escape pressed anywhere ELSE in the app (typing on
+    // Sales, scanning on Restock) would silently act on a dialog the user
+    // can't even see — e.g. confirming a delete they never looked at
+    // again. Gating on isActiveTab keeps the "state persists across tabs"
+    // behavior while making sure only keys pressed WHILE this screen is
+    // actually the one on-screen can do anything.
+    if (!isActiveTab) return;
+
     const handleStockDialogKeys = (e) => {
       // A barcode scanner types its payload and then sends Enter, all within a
       // few milliseconds. A stray scan with the delete dialog open used to
@@ -237,7 +256,8 @@ function StockManagement({ inventory, onAddNewStock, onQuickRestock, onDeleteSto
     };
     window.addEventListener("keydown", handleStockDialogKeys);
     return () => window.removeEventListener("keydown", handleStockDialogKeys);
-  }, [deleteDialog.isOpen, validationDialog.isOpen, pendingStockCollisions.length, quickAddDialog.isOpen, onDeleteStock]);
+  }, [isActiveTab, deleteDialog.isOpen, validationDialog.isOpen, pendingStockCollisions.length, quickAddDialog.isOpen, onDeleteStock]);
+
 
   useEffect(() => {
     if (validationDialog.isOpen && ackButtonRef.current) {

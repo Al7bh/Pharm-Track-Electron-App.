@@ -84,18 +84,29 @@ export const sanitizeScannerPayload = (scan) => {
   // to any coincidental "01"+14-digit run anywhere in the string. A large
   // jump distance means what's being discarded is very likely the actual
   // intended start of a different, non-GS1-128 barcode that just happens
-  // to contain a matching digit run further in — confirmed against two
-  // real inventory rows where this fabricated a GTIN with no real basis
-  // (from barcodes starting "8014..." and "1210...", neither of which is
+  // to contain a matching digit run further in — confirmed against real
+  // inventory rows where this fabricated a GTIN with no real basis (from
+  // barcodes starting "8014..." and "1210...", neither of which is
   // GS1-128 at all). Genuine leading scanner noise is a few stray
   // characters, not dozens.
+  //
+  // The short-distance cap above ISN'T enough on its own, though: on an
+  // all-digit barcode like "8014261880...", a fake "01"+14-digit run can
+  // start at index 1 too — well inside the cap — and stripping there
+  // chops a real leading digit off a plain numeric code, not noise. Real
+  // scanner noise is non-digit junk (control bytes, stray symbols); it
+  // never looks like more digits belonging to the same number. So this
+  // only strips when the discarded prefix has at least one non-digit
+  // character in it — confirmed against that same "8014..." row, which
+  // this used to still mis-fire on even under the 5-char cap.
   const MAX_NOISE_PREFIX = 5;
   const startMatch = sanitized.match(/01\d{14}/);
   if (
     startMatch &&
     startMatch.index !== undefined &&
     startMatch.index > 0 &&
-    startMatch.index <= MAX_NOISE_PREFIX
+    startMatch.index <= MAX_NOISE_PREFIX &&
+    !/^\d+$/.test(sanitized.slice(0, startMatch.index))
   ) {
     sanitized = sanitized.slice(startMatch.index);
   }
@@ -156,7 +167,9 @@ const findValidExpiryPosition = (rest) => {
 // The separator after "Rs" (".", ":", or nothing) and the whitespace around
 // it are both optional because different scans from this pharmacy are
 // inconsistent about them.
-const PRICE_REGEX = /^(.*?)s?\W*?Rs\s*[.:]?\s*(\d+(?:\.\d+)?)/i;
+// Also recognizes "M.R.P." (with periods, no "Rs" alongside at all) —
+// confirmed against a real scan ending "...NORPLAT75MGTABM.R.P.684.67".
+const PRICE_REGEX = /^(.*?)s?\W*?(?:Rs|M\.?R\.?P\.?)\s*[.:]?\s*(\d+(?:\.\d+)?)/i;
 
 // "MRP" (Maximum Retail Price) is a label prefix printed right before the
 // price, not a product name — this pharmacy's scans just don't separate
@@ -267,19 +280,30 @@ const resolveBatchAndTrailing = (afterExpiry) => {
   //
   // This has to be told apart from the coincidental "21" case above (e.g.
   // "0033T212", where "21" is just two digits of the batch number). The
-  // reliable signal: a genuine embedded serial here is always short-range
-  // uppercase/digits with NO lowercase letters, running all the way to
-  // the next marker — a coincidental match runs straight into ordinary
-  // batch digits or lowercase name text within just a character or two,
-  // which is why the length and no-lowercase checks below both matter.
+  // reliable signal: a genuine embedded serial here always leads into an
+  // actual "240" name marker further along — a coincidental "21" that's
+  // really just part of the batch digits has no such marker to lead into
+  // (the batch is simply the whole remaining region, nothing after it).
+  // Confirmed against a real scan, "Tab Abocal" with batch "862151XV" and
+  // no name/price suffix at all: without requiring a real "240" here, the
+  // coincidental "21" inside "862151XV" got mistaken for a serial start,
+  // truncating the batch down to just "86".
   const findGenuineSerialBoundary = (text) => {
     let i = 0;
     while (true) {
       const idx = text.indexOf("21", i);
       if (idx === -1) return -1;
+      // A genuine embedded serial always comes AFTER some real batch
+      // content — idx === 0 would mean "no batch at all", which doesn't
+      // happen. Without this, a batch that simply STARTS with "21" (e.g.
+      // "218F48" on a real "NORPLAT 75mg" scan) gets mistaken for having
+      // zero-length batch + a serial from character 0, wiping the batch
+      // out entirely. Confirmed against that scan.
+      if (idx === 0) { i = idx + 1; continue; }
       const after = text.slice(idx + 2);
       const nameIdx = after.indexOf("240");
-      const span = nameIdx >= 0 ? after.slice(0, nameIdx) : after;
+      if (nameIdx === -1) { i = idx + 1; continue; }
+      const span = after.slice(0, nameIdx);
       if (span.length >= 4 && !/[a-z]/.test(span)) return idx;
       i = idx + 1;
     }
@@ -352,6 +376,28 @@ const parseNoSeparatorFallback = (sanitized) => {
     return result;
   }
 
+  if (rest.startsWith("11") && expPos === 8) {
+    // Order: GTIN -> production date(11) -> expiry(17) -> batch(10) ->
+    // (name/serial chain). Same AI order (11, 17, 10, 240) already
+    // supported above in parenthesized form, e.g.
+    // "(01)...(11)251210(17)271130(10)F3973(240)MRP RS.96.50" — this is
+    // that identical order with no separators at all. Confirmed against
+    // seven real scans, all "...240MRP RS.xxx.xx"-suffixed, e.g.
+    // "112601281728123110F5013240MRP RS.280.00" -> prod-date 2026-01-28,
+    // expiry 2028-12-31, batch F5013, price 280.00. The "expPos === 8"
+    // check (production date is always exactly "11"+6 digits = 8 chars)
+    // is what distinguishes this from a coincidental "17"+valid-date
+    // showing up elsewhere by chance.
+    const resolved = resolveBatchAndTrailing(rest.slice(expPos + 8));
+    if (!resolved) return result;
+    result.gtin = gtin;
+    result.expiry = expiry;
+    result.batch = resolved.batch;
+    if (resolved.name) result.name = resolved.name;
+    if (resolved.retailPrice) result.retailPrice = resolved.retailPrice;
+    return result;
+  }
+
   if (rest.startsWith("10")) {
     // Order: GTIN -> batch -> expiry -> (serial/name chain).
     result.gtin = gtin;
@@ -363,6 +409,37 @@ const parseNoSeparatorFallback = (sanitized) => {
   }
 
   if (rest.startsWith("21")) {
+    // Order: GTIN -> serial(21, fixed 14 chars) -> batch(10) -> production
+    // date(11) -> expiry(17) -> optionally a name/price chain(240/21).
+    // Distinct from the "serial ahead of expiry/batch" ordering below:
+    // here batch comes BEFORE expiry, with a production date sandwiched
+    // between them, and the serial is always exactly 14 characters wide
+    // before "10" begins. Confirmed against six real scans ending right
+    // after expiry with nothing further, e.g.
+    // "21Y79X4M7T6705W910MG0441126051917280518" -> 14-char serial + batch
+    // "MG044" + prod-date 260519 + expiry 280518 (2028-05) — and a
+    // seventh with a name/price blob still attached after expiry, e.g.
+    // "21PLCMERG1KB8L40100451126060017280500240Osso-Dsusp120ml1s.Rs.550.00"
+    // -> serial + batch "045" + prod-date 260600 + expiry 280500
+    // (2028-05) + "240Osso-Dsusp120ml1s.Rs.550.00". Tried first (more
+    // specific) before the looser "21 ahead of everything" shape further
+    // down.
+    const afterSerial = rest.slice(2 + 14);
+    const fixedOrderMatch = afterSerial.startsWith("10")
+      ? afterSerial.slice(2).match(/^(.*?)11(\d{6})17(\d{6})(.*)$/)
+      : null;
+    if (fixedOrderMatch) {
+      const [, fixedBatch, , fixedExpiryDigits, fixedTrailing] = fixedOrderMatch;
+      if (fixedBatch && isValidYYMMDD(fixedExpiryDigits)) {
+        const fixedYear = 2000 + parseInt(fixedExpiryDigits.slice(0, 2), 10);
+        result.gtin = gtin;
+        result.batch = fixedBatch;
+        result.expiry = `${fixedYear}-${fixedExpiryDigits.slice(2, 4)}`;
+        if (fixedTrailing) parseTrailingChain(fixedTrailing, result);
+        return result;
+      }
+    }
+
     // Order: GTIN -> serial(21) -> expiry -> batch -> (name/serial chain).
     // Reverse-engineered from real scans (this pharmacy's generator
     // sometimes puts the serial number ahead of expiry/batch instead of
@@ -469,6 +546,34 @@ const parseParenthesizedFormat = (sanitized) => {
   return foundAny ? result : null;
 };
 
+// =========================================================================
+// SLASH-FORMATTED DATES (a distinct, non-standard variant)
+// =========================================================================
+// Standard GS1 AI 11/17 values are exactly 6 digits (YYMMDD), no
+// separators. At least one manufacturer's barcode generator instead
+// prints the date as literal DD/MM/YYYY. Confirmed against one real scan:
+// "01" + GTIN + "17" + "30/09/2027" + "10" + batch + "11" + a second
+// slash-date (production date) + "240" + name/price — e.g.
+// "01089640015631811730/09/20271025802051131/10/2025240Cefia400mgCaps5sRs564.00"
+// decodes as expiry 2027-09, batch "2580205", price 564.00. Only one
+// example so far, but the literal slashes make the AI boundaries
+// unambiguous even from a single scan — there's no other way to read
+// "30/09/2027" as anything but a date, so this doesn't carry the same
+// "might be a coincidence" risk that the plain-digit patterns above do.
+const parseSlashDateFormat = (sanitized) => {
+  const match = sanitized.match(
+    /^01(\d{14})17(\d{2})\/(\d{2})\/(\d{4})10(.*?)11\d{2}\/\d{2}\/\d{4}(240.*)?$/
+  );
+  if (!match) return null;
+
+  const [, gtin, dd, mm, yyyy, batch, trailing] = match;
+  if (!batch) return null;
+
+  const result = { gtin, batch, expiry: `${yyyy}-${mm}`, name: "", retailPrice: "" };
+  if (trailing) parseTrailingChain(trailing, result);
+  return result;
+};
+
 export const parsePharmacyBarcode = (scan) => {
   const parsed = {
     raw: scan || "",
@@ -481,6 +586,16 @@ export const parsePharmacyBarcode = (scan) => {
 
   const sanitized = sanitizeScannerPayload(scan);
   if (!sanitized) return parsed;
+
+  const slashDated = parseSlashDateFormat(sanitized);
+  if (slashDated && slashDated.batch && slashDated.expiry) {
+    parsed.gtin = slashDated.gtin;
+    parsed.batch = slashDated.batch;
+    parsed.expiry = slashDated.expiry;
+    if (slashDated.name) parsed.name = slashDated.name;
+    if (slashDated.retailPrice) parsed.retailPrice = slashDated.retailPrice;
+    return parsed;
+  }
 
   const parenthesized = parseParenthesizedFormat(sanitized);
   if (parenthesized && parenthesized.batch && parenthesized.expiry) {
@@ -638,30 +753,29 @@ export const parsePharmacyBarcode = (scan) => {
 // full raw/junk scan string, saved back when an earlier version of this
 // parser failed on that scan and (per parsePharmacyBarcode's own fallback
 // behavior) stored the raw text as if it were the identifying code. Once
-// the parser is fixed, scanning that SAME product at the sales screen
-// produces the correct clean GTIN — which no longer matches that stored
-// raw row, so the sale now fails with "no product" for those specific
-// items even though nothing about the physical barcode changed.
+// the parser is fixed, scanning that SAME product produces the correct
+// clean GTIN — which no longer matches that stored raw row, so a scan now
+// fails to find it even though nothing about the physical barcode changed.
 //
 // This isn't something parsePharmacyBarcode itself can fix — it only
-// resolves what the scan *means*, not what's sitting in the database. The
-// sales-screen lookup needs to try more than one candidate string against
-// `inventory.barcode` before giving up. Use this helper there:
-//
-//   import { getBarcodeLookupCandidates } from "./gs1Parser";
-//   const candidates = getBarcodeLookupCandidates(rawScan);
-//   let product = null;
-//   for (const candidate of candidates) {
-//     product = await db.inventory.findByBarcode(candidate); // your existing lookup
-//     if (product) break;
-//   }
-//   if (!product) { /* existing "no product" handling */ }
-//
-// Order matters: the clean parsed GTIN is tried first (the correct,
+// resolves what the scan *means*, not what's sitting in the database. Any
+// screen that matches a scan against `inventory.barcode` needs to try more
+// than one candidate string before giving up. getBarcodeLookupCandidates
+// below returns that list, ordered clean-GTIN-first (the correct,
 // going-forward match), then progressively less-cleaned forms of the same
 // scan, on the chance an older row still has one of those stored verbatim.
-// I don't have the sales-screen scan-handling file in front of me — if you
-// share it, I can wire this in directly instead of leaving it as a snippet.
+//
+// Wired into all three barcode-driven screens:
+//   - Sales (App.jsx's handleGlobalBarcodeScan) — tries each candidate
+//     against getProductsByBarcode in turn until one hits.
+//   - Inventory / Stock Management (StockManagement.jsx) — matches the
+//     in-memory inventory list against every candidate, not just the
+//     clean GTIN.
+//   - Restock (RestockScreen.jsx) — same.
+// In all three, once a legacy row is matched via an old candidate, any
+// NEW batch/product saved from that point on is written back out with
+// the clean GTIN (not the old junk string) — so touching a legacy item
+// through any of these screens self-heals its barcode going forward.
 export const getBarcodeLookupCandidates = (scan) => {
   const parsed = parsePharmacyBarcode(scan);
   const sanitized = sanitizeScannerPayload(scan);
